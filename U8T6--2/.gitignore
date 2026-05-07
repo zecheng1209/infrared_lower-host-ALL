@@ -1,0 +1,23 @@
+# MDK-ARM 编译生成的文件
+MDK-ARM/U8T6--2/*.crf
+MDK-ARM/U8T6--2/*.d
+MDK-ARM/U8T6--2/*.o
+MDK-ARM/U8T6--2/*.axf
+MDK-ARM/U8T6--2/*.hex
+MDK-ARM/U8T6--2/*.htm
+MDK-ARM/U8T6--2/*.lnp
+MDK-ARM/U8T6--2/*.map
+MDK-ARM/U8T6--2/*.dep
+MDK-ARM/U8T6--2/*.sct
+MDK-ARM/U8T6--2/*.iex
+
+# 日志文件
+MDK-ARM/JLinkLog.txt
+
+# 用户配置文件
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
+
+# 其他临时文件
+*.lst
+*.dep

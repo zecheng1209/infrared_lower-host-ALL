@@ -1,0 +1,9 @@
+mechanical_arm\retarget_os_rtos2.o: C:/Users/zhong/AppData/Local/Arm/Packs/ARM/CMSIS-Compiler/2.1.0/source/armcc/retarget_os_rtos2.c
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Keil_v5\ARM\ARMCC\Bin\..\include\assert.h
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Arm\Packs\ARM\CMSIS-Compiler\2.1.0\include\armcc\retarget_os.h
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Keil_v5\ARM\ARMCC\Bin\..\include\rt_heap.h
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Keil_v5\ARM\ARMCC\Bin\..\include\rt_locale.h
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Keil_v5\ARM\ARMCC\Bin\..\include\rt_misc.h
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
+mechanical_arm\retarget_os_rtos2.o: C:\Users\zhong\AppData\Local\Keil_v5\ARM\ARMCC\Bin\..\include\time.h
