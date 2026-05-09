@@ -65,7 +65,6 @@ typedef enum {
     IR_HOST_STATUS_TIMEOUT = 0x04,
     IR_HOST_STATUS_NACK = 0x05,
     IR_HOST_STATUS_ERROR = 0x06
-// 主机响应帧结构体
 } IR_Host_Status_t;//主机状态
 
 typedef enum {
@@ -99,14 +98,14 @@ typedef struct {
     uint32_t timestamp;
 } IR_Host_RxFrame_t;//主机接收帧
 
+// 主机响应帧结构体
 typedef struct {
     uint8_t module_id;
     IR_Host_Status_t status;
-    // 模块节点链表头指针
-    uint8_t count;
-    SemaphoreHandle_t mutex;
-} IR_Module_List_t;//模块节点链表
     bool valid;
+    uint8_t length;
+    uint8_t data[8];
+    uint32_t timestamp;
 } IR_Host_ResponseFrame_t;
 
 typedef struct {
