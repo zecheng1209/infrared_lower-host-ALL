@@ -1,0 +1,100 @@
+# ==========================================
+# Keil MDK-ARM 编译生成文件
+# ==========================================
+*.crf
+*.d
+*.o
+*.axf
+*.hex
+*.elf
+*.bin
+*.htm
+*.lnp
+*.map
+*.dep
+*.sct
+*.iex
+*.lst
+
+# MDK-ARM 用户配置文件
+*.uvguix.*
+*.uvoptx
+*.uvopt
+JLinkLog.txt
+JLinkSettings.ini
+EventRecorderStub.scvd
+
+# 编译输出目录
+**/MDK-ARM/*/
+**/build/
+**/obj/
+**/bin/
+**/out/
+
+# ==========================================
+# STM32CubeMX
+# ==========================================
+*.mxproject
+*.ioc.bak
+*.ioc.user
+**/.mxproject
+
+# ==========================================
+# VSCode
+# ==========================================
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# ==========================================
+# Eclipse/STM32CubeIDE
+# ==========================================
+.project
+.cproject
+.settings/
+Debug/
+Release/
+
+# ==========================================
+# EIDE (Embedded IDE)
+# ==========================================
+.eide/log
+.eide.usr.ctx.json
+*.ept
+*.eide-template
+
+# ==========================================
+# Windows 系统文件
+# ==========================================
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ==========================================
+# macOS 系统文件
+# ==========================================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ==========================================
+# 临时文件
+# ==========================================
+*~
+*.swp
+*.swo
+*.*~
+*.bak
+*.tmp
+*.log
+
+# ==========================================
+# 其他
+# ==========================================
+*.orig
+*.rej
+*.patch
