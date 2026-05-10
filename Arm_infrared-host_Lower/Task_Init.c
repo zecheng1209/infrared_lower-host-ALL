@@ -59,7 +59,7 @@ void Task_Init(void)
 //	xTaskCreate(Motor_Drive, "Motor_Drive", 256, NULL, 4, &Motor_Drive_Handle);
 //	xTaskCreate(Motor_RM, "Motor_RM", 256, NULL, 4, &Motor_RM_Handle);
 
-    IR_Test_StartTask();//红外测试代码
+    //IR_StartTest(&hcan1);//红外测试代码（已禁用发送）
 }
 
 void RampToTarget(float *val, float target, float step)//斜坡

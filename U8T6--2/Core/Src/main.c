@@ -52,15 +52,29 @@ extern volatile uint8_t can_rx_buffer[8];
 extern volatile uint8_t can_rx_flag;
 extern volatile uint32_t can_rx_id;
 
-// 红外发送状态（用于非阻塞状态机）
-#define IR_TX_IDLE       0
-#define IR_TX_WAIT_ACK   1
-volatile uint8_t ir_tx_state = IR_TX_IDLE;
-volatile uint8_t tx_count = 0;  // 发送计数器
+// ===== CAN→红外 发送队列（FIFO，防丢帧） =====
+#define CAN_TO_IR_QUEUE_SIZE  4
+typedef struct {
+    uint8_t data[8];
+    uint8_t valid;
+} CanToIrSlot_t;
+CanToIrSlot_t can_to_ir_queue[CAN_TO_IR_QUEUE_SIZE];
+volatile uint8_t can_to_ir_head = 0;  // 写入位置
+volatile uint8_t can_to_ir_tail = 0;  // 读取位置
+volatile uint8_t can_to_ir_count = 0; // 队列中的有效数量
 
-// CAN→红外发送缓冲区
-uint8_t can_to_ir_buffer[8];
-uint8_t can_to_ir_ready = 0;  // 数据就绪标志
+// ===== 红外→CAN 转发队列（FIFO，防丢帧） =====
+#define IR_TO_CAN_QUEUE_SIZE   4
+typedef struct {
+    uint32_t can_id;
+    uint8_t  data[8];
+    uint8_t  dlc;
+    uint8_t  valid;
+} IrToCanSlot_t;
+IrToCanSlot_t ir_to_can_queue[IR_TO_CAN_QUEUE_SIZE];
+volatile uint8_t ir_to_can_head = 0;
+volatile uint8_t ir_to_can_tail = 0;
+volatile uint8_t ir_to_can_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -125,11 +139,12 @@ while (1)
 {
     IR_CheckRxTimeout();
 
-    // ========== CAN → 处理 ==========
-    if (can_rx_flag && !IR_IsTXBusy())
+    // ====================================================================
+    //  第1步: CAN接收 → 入队（不阻塞，不丢帧）
+    // ====================================================================
+    if (can_rx_flag)
     {
         can_rx_flag = 0;
-
         uint8_t rx_module_id = IR_HOST_CAN_ID_GET_MODULE(can_rx_id);
 
         if (IR_HOST_IS_CMD_FRAME(can_rx_id))
@@ -137,14 +152,9 @@ while (1)
             if (rx_module_id == IR_MODULE_ID)
             {
                 uint8_t cmd = can_rx_buffer[1];
-
-                if (cmd == IR_HOST_CMD_PING)
+                if (cmd == IR_HOST_CMD_PING || cmd == IR_HOST_CMD_READ_STATUS)
                 {
-                    CAN_SendFrame(IR_HOST_CAN_ID_ACK(IR_MODULE_ID),
-                                  (uint8_t[]){IR_ACK_MAGIC, IR_ACK_MAGIC}, 2);
-                }
-                else if (cmd == IR_HOST_CMD_READ_STATUS)
-                {
+                    // CMD帧直接回CAN ACK，不需要红外参与
                     CAN_SendFrame(IR_HOST_CAN_ID_ACK(IR_MODULE_ID),
                                   (uint8_t[]){IR_ACK_MAGIC, IR_ACK_MAGIC}, 2);
                 }
@@ -158,57 +168,107 @@ while (1)
         }
         else if (IR_HOST_IS_DATA_FRAME(can_rx_id))
         {
-            if (rx_module_id == IR_MODULE_ID) {
-                memcpy(can_to_ir_buffer, (const void *)&can_rx_buffer[0], 8);
-                can_to_ir_ready = 1;
+            // DATA帧 → 入队等红外空闲时转发
+            if (rx_module_id == IR_MODULE_ID && can_to_ir_count < CAN_TO_IR_QUEUE_SIZE)
+            {
+                CanToIrSlot_t *slot = &can_to_ir_queue[can_to_ir_head];
+                memcpy(slot->data, (const void *)can_rx_buffer, 8);
+                slot->valid = 1;
+                can_to_ir_head = (can_to_ir_head + 1) % CAN_TO_IR_QUEUE_SIZE;
+                can_to_ir_count++;
             }
         }
     }
 
-    // ========== 红外发送（转发CAN数据到红外） ==========
-    if (can_to_ir_ready && !IR_IsTXBusy())
+    // ====================================================================
+    //  第2步: CAN→红外 出队发送（红外空闲时才发）
+    // ====================================================================
+    if (can_to_ir_count > 0 && !IR_IsTXBusy())
     {
-        if (IR_SendData(can_to_ir_buffer, 8))
+        CanToIrSlot_t *slot = &can_to_ir_queue[can_to_ir_tail];
+        if (slot->valid)
         {
-            can_to_ir_ready = 0;
+            if (IR_SendData(slot->data, 8))
+            {
+                slot->valid = 0;
+                can_to_ir_tail = (can_to_ir_tail + 1) % CAN_TO_IR_QUEUE_SIZE;
+                can_to_ir_count--;
+            }
         }
     }
 
-    // ==========  红外 → CAN（ACK/NACK转发） ==========
-    // 单向测试模式：对方不发数据，禁用此段
-    // if (ir_ack_received_flag)
-    // {
-    //     ir_ack_received_flag = 0;
-    //
-    //     if (ir_ack_status == 1)
-    //     {
-    //         CAN_SendFrame(IR_HOST_CAN_ID_ACK(IR_MODULE_ID),
-    //                       (uint8_t[]){IR_ACK_MAGIC, IR_ACK_MAGIC}, 2);
-    //     }
-    //     else
-    //     {
-    //         CAN_SendFrame(IR_HOST_CAN_ID_ACK(IR_MODULE_ID),
-    //                       (uint8_t[]){IR_NACK_MAGIC, IR_NACK_MAGIC}, 2);
-    //     }
-    // }
+    // ====================================================================
+    //  第3步: 红外接收 → 入队（不阻塞，不丢帧）
+    // ====================================================================
 
-    // ==========  红外 → CAN（数据帧转发） ==========
-    // 单向测试模式：对方不发数据，禁用此段
-    // if (ir_rx_complete_flag)
-    // {
-    //     ir_rx_complete_flag = 0;
-    //
-    //     uint8_t calculated_crc = IR_CRC8(received_data, 8);
-    //     if (calculated_crc == received_data[8])
-    //     {
-    //         IR_SendDataAck_NonBlocking(1);
-    //         CAN_SendFrame(IR_HOST_CAN_ID_DATA(IR_MODULE_ID), received_data, 8);
-    //     }
-    //     else
-    //     {
-    //         IR_SendDataAck_NonBlocking(2);
-    //     }
-    // }
+    // 红外收到数据帧 → 入队等CAN转发
+    if (ir_rx_complete_flag)
+    {
+        ir_rx_complete_flag = 0;
+        uint8_t calculated_crc = IR_CRC8(received_data, 8);
+        if (calculated_crc == received_data[8])
+        {
+            // 先回红外ACK（非阻塞），不进队列
+            IR_SendDataAck_NonBlocking(1);
+
+            // 数据入队等CAN转发
+            if (ir_to_can_count < IR_TO_CAN_QUEUE_SIZE)
+            {
+                IrToCanSlot_t *slot = &ir_to_can_queue[ir_to_can_head];
+                slot->can_id = IR_HOST_CAN_ID_DATA(IR_MODULE_ID);
+                memcpy(slot->data, received_data, 8);
+                slot->dlc = 8;
+                slot->valid = 1;
+                ir_to_can_head = (ir_to_can_head + 1) % IR_TO_CAN_QUEUE_SIZE;
+                ir_to_can_count++;
+            }
+        }
+        else
+        {
+            IR_SendDataAck_NonBlocking(2);  // CRC错误回NACK
+        }
+    }
+
+    // 红外收到ACK/NACK → 入队等CAN转发
+    if (ir_ack_received_flag)
+    {
+        ir_ack_received_flag = 0;
+        if (ir_to_can_count < IR_TO_CAN_QUEUE_SIZE)
+        {
+            IrToCanSlot_t *slot = &ir_to_can_queue[ir_to_can_head];
+            slot->can_id = IR_HOST_CAN_ID_ACK(IR_MODULE_ID);
+            if (ir_ack_status == 1)
+            {
+                uint8_t ack_data[2] = {IR_ACK_MAGIC, IR_ACK_MAGIC};
+                memcpy(slot->data, ack_data, 2);
+                slot->dlc = 2;
+            }
+            else
+            {
+                uint8_t nack_data[2] = {IR_NACK_MAGIC, IR_NACK_MAGIC};
+                memcpy(slot->data, nack_data, 2);
+                slot->dlc = 2;
+            }
+            slot->valid = 1;
+            ir_to_can_head = (ir_to_can_head + 1) % IR_TO_CAN_QUEUE_SIZE;
+            ir_to_can_count++;
+        }
+    }
+
+    // ====================================================================
+    //  第4步: 红外→CAN 出队转发（CAN总是空闲，直接发）
+    // ====================================================================
+    if (ir_to_can_count > 0)
+    {
+        IrToCanSlot_t *slot = &ir_to_can_queue[ir_to_can_tail];
+        if (slot->valid)
+        {
+            CAN_SendFrame(slot->can_id, slot->data, slot->dlc);
+            slot->valid = 0;
+            ir_to_can_tail = (ir_to_can_tail + 1) % IR_TO_CAN_QUEUE_SIZE;
+            ir_to_can_count--;
+        }
+    }
 }
 /* USER CODE END 3 */
 }

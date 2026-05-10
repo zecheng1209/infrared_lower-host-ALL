@@ -94,9 +94,6 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_CAN2_Init();
-  IR_Host_Init();
-  IR_Host_StartTask();
-  IR_Host_AddModule(IR_HOST_DEFAULT_MODULE_ID);
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */

@@ -177,7 +177,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 		uint8_t rx_data[8];
 		CAN_RxHeaderTypeDef rx_header;
 		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
-			IR_Host_ProcessRxFrame(&rx_header, rx_data);
+			IR_OnCanRx(&rx_header, rx_data);
 		}
 	}
 	else if (hcan->Instance == CAN2)
