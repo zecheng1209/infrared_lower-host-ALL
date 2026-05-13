@@ -17,7 +17,7 @@ RobStride_t rs03={.hcan=&hcan2,.motor_id=0x02,.type= RobStride_03 };
 
 float rs03_torque=-0.0f,rs03_rad=-0.2f,rs03_omega=0.2f;
 float rs03_kp=350.0f,rs03_kd=38.0f;
-PID rs03_pos_pid;  // λ�û�PID
+PID rs03_pos_pid;  
 
 
 
@@ -164,12 +164,18 @@ uint8_t buf[8];
 //		uint32_t ID = CAN_Receive_DataFrame(hcan, buf);
 //		
 //		RobStrideRecv_Handle(&rs03, hcan, ID, buf);
-////		RobStrideRecv_Handle(&Joint[1].Rs_motor, &hcan1, ID, buf);
-////		RobStrideRecv_Handle(&Joint[2].Rs_motor, &hcan1, ID, buf);
-////		RobStrideRecv_Handle(&Joint[3].Rs_motor, &hcan1, ID, buf);
+//		RobStrideRecv_Handle(&Joint[1].Rs_motor, &hcan1, ID, buf);
+//		RobStrideRecv_Handle(&Joint[2].Rs_motor, &hcan1, ID, buf);
+//		RobStrideRecv_Handle(&Joint[3].Rs_motor, &hcan1, ID, buf);
 //	}
 //}
 		uint16_t ID;
+// 原始CAN接收计数器（不经过infrared_host，用于底层诊断）
+volatile uint32_t raw_can_rx_count = 0;
+volatile uint32_t raw_can_rx_id = 0;
+volatile uint8_t  raw_can_rx_data[8] = {0};
+
+// CAN1 FIFO0回调 — 红外模块如果接CAN1则在这里处理
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
 	if (hcan->Instance == CAN1)
@@ -177,14 +183,24 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 		uint8_t rx_data[8];
 		CAN_RxHeaderTypeDef rx_header;
 		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
+			raw_can_rx_count++;
+			raw_can_rx_id = rx_header.StdId;
+			memcpy((void*)raw_can_rx_data, rx_data, rx_header.DLC > 8 ? 8 : rx_header.DLC);
 			IR_OnCanRx(&rx_header, rx_data);
 		}
 	}
-	else if (hcan->Instance == CAN2)
+}
+
+void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+	if (hcan->Instance == CAN2)
 	{
-		uint8_t buf[8];
-		ID = CAN_Receive_DataFrame(&hcan2, buf);
-//		Motor2006Recv(&Joint[4].RM_motor, &hcan2, ID, buf);
+		uint8_t rx_data[8];
+		CAN_RxHeaderTypeDef rx_header;
+		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header, rx_data) == HAL_OK) {
+			// IR当前用CAN1，这里只处理RobStride电机
+			RobStrideRecv_Handle(&rs03, hcan, rx_header.StdId, rx_data);
+		}
 	}
 }
 

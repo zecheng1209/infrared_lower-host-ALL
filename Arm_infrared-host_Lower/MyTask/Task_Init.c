@@ -51,7 +51,9 @@ void Task_Init(void)
     HAL_CAN_ActivateNotification(&hcan1,CAN_IT_TX_MAILBOX_EMPTY);
     HAL_CAN_ActivateNotification(&hcan2,CAN_IT_TX_MAILBOX_EMPTY);
 
-	IR_Init(&hcan1, (uint8_t[]){0x10}, 1);
+	
+	//红外模块初始化（CAN1）
+	IR_Init(&hcan1, (uint8_t[]){0x10,0x11}, 2);
 
 	RobStrideInit(&rs03, &hcan2, 0x02, RobStride_03);
 	RobStrideSetMode(&rs03, RobStride_MotionControl);
@@ -66,7 +68,7 @@ void Task_Init(void)
 	//	xTaskCreate(Motor_reset, "Motor_reset", 300, NULL, 4, &Motor_Reset_Handle);//复位
     //xTaskCreate(MotorSendTask, "MotorSendTask", 128, NULL, 4, &MotorSendTask_Handle);//将数据发送到PC
 		
-  //IR_StartTest(&hcan1);//红外测试逻辑（已禁用发送）
+  //IR_StartTest(&hcan2);//红外测试逻辑（发送端用，接收端不需要）
 }
 
 void RampToTarget(float *val, float target, float step)//斜坡

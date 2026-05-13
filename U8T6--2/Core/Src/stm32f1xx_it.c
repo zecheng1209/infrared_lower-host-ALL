@@ -280,10 +280,13 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK)
     {
-        // 只处理标准ID的数据帧
-        if (rx_header.IDE == CAN_ID_STD && rx_header.DLC == 8)
+        // 只处理标准ID的数据帧（允许任意DLC）
+        if (rx_header.IDE == CAN_ID_STD && rx_header.RTR == CAN_RTR_DATA)
         {
-            memcpy((void*)can_rx_buffer, rx_data, 8);
+            uint8_t dlc = rx_header.DLC;
+            if (dlc > 8) dlc = 8;
+            memset((void*)can_rx_buffer, 0, 8);
+            memcpy((void*)can_rx_buffer, rx_data, dlc);
             can_rx_id = rx_header.StdId;
             can_rx_flag = 1;
             can_rx_success_count++;
@@ -291,7 +294,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         else
         {
             can_rx_fail_count++;
-            can_last_error = 1;  // ID类型或DLC不匹配
+            can_last_error = 1;  // ID类型不匹配或远程帧
         }
     }
     else
