@@ -52,8 +52,8 @@ void Task_Init(void)
     HAL_CAN_ActivateNotification(&hcan2,CAN_IT_TX_MAILBOX_EMPTY);
 
 	
-	//红外模块初始化（CAN1）
-	IR_Init(&hcan1, (uint8_t[]){0x10,0x11}, 2);
+	//红外模块初始化（CAN2）
+	IR_Init(&hcan2, (uint8_t[]){0x10}, 1);
 
 	RobStrideInit(&rs03, &hcan2, 0x02, RobStride_03);
 	RobStrideSetMode(&rs03, RobStride_MotionControl);
