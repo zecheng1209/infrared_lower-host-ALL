@@ -259,10 +259,18 @@ void TIM3_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
-// CAN接收缓冲区
-volatile uint8_t can_rx_buffer[8];
-volatile uint8_t can_rx_flag = 0;
-volatile uint32_t can_rx_id = 0;
+// CAN接收环形缓冲队列（替代单缓冲，防止多帧连续到达时丢帧）
+#define CAN_RX_QUEUE_SIZE  4
+typedef struct {
+    uint32_t can_id;
+    uint8_t  data[8];
+    uint8_t  dlc;
+} CanRxSlot_t;
+
+volatile CanRxSlot_t can_rx_queue[CAN_RX_QUEUE_SIZE];
+volatile uint8_t can_rx_head = 0;    // 写入位置（ISR侧）
+volatile uint8_t can_rx_tail = 0;    // 读取位置（main侧）
+volatile uint8_t can_rx_count = 0;
 
 // CAN调试变量 - 在Debug窗口观察
 volatile uint32_t can_irq_count = 0;       // CAN中断进入次数
@@ -280,21 +288,29 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK)
     {
-        // 只处理标准ID的数据帧（允许任意DLC）
-        if (rx_header.IDE == CAN_ID_STD && rx_header.RTR == CAN_RTR_DATA)
+        // 标准ID帧，DLC 1~8
+        if (rx_header.IDE == CAN_ID_STD && rx_header.DLC >= 1 && rx_header.DLC <= 8)
         {
-            uint8_t dlc = rx_header.DLC;
-            if (dlc > 8) dlc = 8;
-            memset((void*)can_rx_buffer, 0, 8);
-            memcpy((void*)can_rx_buffer, rx_data, dlc);
-            can_rx_id = rx_header.StdId;
-            can_rx_flag = 1;
-            can_rx_success_count++;
+            if (can_rx_count < CAN_RX_QUEUE_SIZE)
+            {
+                volatile CanRxSlot_t *slot = &can_rx_queue[can_rx_head];
+                slot->can_id = rx_header.StdId;
+                slot->dlc = rx_header.DLC;
+                memcpy((void*)slot->data, rx_data, rx_header.DLC);
+                can_rx_head = (can_rx_head + 1) % CAN_RX_QUEUE_SIZE;
+                can_rx_count++;
+                can_rx_success_count++;
+            }
+            else
+            {
+                can_rx_fail_count++;
+                can_last_error = 3;  // 队列满，丢帧
+            }
         }
         else
         {
             can_rx_fail_count++;
-            can_last_error = 1;  // ID类型不匹配或远程帧
+            can_last_error = 1;  // ID类型或DLC不匹配
         }
     }
     else

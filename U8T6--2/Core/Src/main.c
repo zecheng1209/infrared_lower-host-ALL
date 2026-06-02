@@ -47,10 +47,18 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-// 外部声明CAN接收变量
-extern volatile uint8_t can_rx_buffer[8];
-extern volatile uint8_t can_rx_flag;
-extern volatile uint32_t can_rx_id;
+// 外部声明CAN接收环形队列
+#define CAN_RX_QUEUE_SIZE  4
+typedef struct {
+    uint32_t can_id;
+    uint8_t  data[8];
+    uint8_t  dlc;
+} CanRxSlot_t;
+
+extern volatile CanRxSlot_t can_rx_queue[CAN_RX_QUEUE_SIZE];
+extern volatile uint8_t can_rx_head;
+extern volatile uint8_t can_rx_tail;
+extern volatile uint8_t can_rx_count;
 
 // ===== 运行时模块ID（可通过CMD_SET_ID远程配置） =====
 volatile uint8_t my_module_id = IR_MODULE_ID;  // 默认取infrared.h中的值
@@ -78,6 +86,11 @@ IrToCanSlot_t ir_to_can_queue[IR_TO_CAN_QUEUE_SIZE];
 volatile uint8_t ir_to_can_head = 0;
 volatile uint8_t ir_to_can_tail = 0;
 volatile uint8_t ir_to_can_count = 0;
+
+// ===== CAN多模块错峰参数 =====
+// 按模块ID低位顺序延迟响应，避免多模块同时抢占总线(hal_delay)
+// 0x10→0ms, 0x11→3ms, 0x12→6ms ...
+#define IR_CAN_STAGGER_BASE_MS  3
 
 // ===== 调试计数器 =====
 volatile uint32_t dbg_can_cmd_received = 0;
@@ -154,17 +167,21 @@ while (1)
     // ====================================================================
     //  第1步: CAN接收 → 处理/入队（不阻塞，不丢帧）
     // ====================================================================
-    if (can_rx_flag)
+    if (can_rx_count > 0)
     {
-        can_rx_flag = 0;
-        uint8_t rx_module_id = IR_HOST_CAN_ID_GET_MODULE(can_rx_id);
+        volatile CanRxSlot_t *slot = &can_rx_queue[can_rx_tail];
 
-        if (IR_HOST_IS_CMD_FRAME(can_rx_id))
+        if (IR_HOST_IS_CMD_FRAME(slot->can_id) && slot->dlc >= 2)
         {
+            uint8_t rx_module_id = IR_HOST_CAN_ID_GET_MODULE(slot->can_id);
+
             // 匹配自身ID 或 广播ID(0x00) 都响应
             if (rx_module_id == my_module_id || rx_module_id == 0x00)
             {
-                uint8_t cmd = can_rx_buffer[1];
+                // ★ 错峰：按模块ID延迟响应，避免多模块同时抢占总线
+                HAL_Delay((my_module_id & 0x0F) * IR_CAN_STAGGER_BASE_MS);
+
+                uint8_t cmd = slot->data[1];
                 dbg_can_cmd_received++;
 
                 if (cmd == IR_HOST_CMD_PING || cmd == IR_HOST_CMD_READ_STATUS)
@@ -180,10 +197,9 @@ while (1)
                                   (uint8_t[]){IR_ACK_MAGIC, IR_ACK_MAGIC}, 2);
                     dbg_can_ack_sent++;
                 }
-                else if (cmd == IR_HOST_CMD_SET_ID)
+                else if (cmd == IR_HOST_CMD_SET_ID && slot->dlc >= 3)
                 {
-                    // 设置新模块ID：CMD帧的data[2]为新ID
-                    uint8_t new_id = can_rx_buffer[2];
+                    uint8_t new_id = slot->data[2];
                     if (new_id >= 0x01 && new_id <= 0xFE)
                     {
                         my_module_id = new_id;
@@ -194,24 +210,36 @@ while (1)
                 }
             }
         }
-        else if (IR_HOST_IS_DATA_FRAME(can_rx_id))
+        else if (IR_HOST_IS_DATA_FRAME(slot->can_id) && slot->dlc >= 1)
         {
+            uint8_t rx_module_id = IR_HOST_CAN_ID_GET_MODULE(slot->can_id);
+
             // DATA帧 → 回CAN ACK + 入队等红外空闲时转发
             if (rx_module_id == my_module_id && can_to_ir_count < CAN_TO_IR_QUEUE_SIZE)
             {
+                // ★ 错峰：按模块ID延迟响应ACK
+                HAL_Delay((my_module_id & 0x0F) * IR_CAN_STAGGER_BASE_MS);
+
                 // 先回CAN ACK，告诉上位机已收到
                 CAN_SendFrame(IR_HOST_CAN_ID_ACK(my_module_id),
                               (uint8_t[]){IR_ACK_MAGIC, IR_ACK_MAGIC}, 2);
                 dbg_can_ack_sent++;
 
-                CanToIrSlot_t *slot = &can_to_ir_queue[can_to_ir_head];
-                memcpy(slot->data, (const void *)can_rx_buffer, 8);
-                slot->valid = 1;
+                CanToIrSlot_t *ir_slot = &can_to_ir_queue[can_to_ir_head];
+                memset(ir_slot->data, 0, 8);
+                memcpy(ir_slot->data, (const void *)slot->data, slot->dlc > 8 ? 8 : slot->dlc);
+                ir_slot->valid = 1;
                 can_to_ir_head = (can_to_ir_head + 1) % CAN_TO_IR_QUEUE_SIZE;
                 can_to_ir_count++;
                 dbg_can_data_received++;
             }
         }
+
+        // 出队（关中断保护，防止ISR的count++被覆盖）
+        __disable_irq();
+        can_rx_tail = (can_rx_tail + 1) % CAN_RX_QUEUE_SIZE;
+        can_rx_count--;
+        __enable_irq();
     }
 
     // ====================================================================
@@ -300,6 +328,8 @@ while (1)
         IrToCanSlot_t *slot = &ir_to_can_queue[ir_to_can_tail];
         if (slot->valid)
         {
+            // ★ 错峰：数据转发也按模块ID延迟，避免多模块同时发送DATA帧
+            HAL_Delay((my_module_id & 0x0F) * IR_CAN_STAGGER_BASE_MS);
             CAN_SendFrame(slot->can_id, slot->data, slot->dlc);
             slot->valid = 0;
             ir_to_can_tail = (ir_to_can_tail + 1) % IR_TO_CAN_QUEUE_SIZE;
