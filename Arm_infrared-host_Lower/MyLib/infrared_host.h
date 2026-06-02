@@ -31,7 +31,7 @@
 #define IR_HOST_CONSISTENT_COUNT   3        ///< 数据一致所需连续次数
 
 /* ================================================================
- *                     CAN ID 编码宏
+ *                     CAN ID 编码宏，结合了帧类型和模块id的编码
  * 方案: [10:8]=帧类型(1=CMD/2=DATA/3=ACK), [7:0]=模块ID
  * 示例:
          1》module_id=0x10 → CMD=0x110, DATA=0x210, ACK=0x310
@@ -63,7 +63,6 @@ typedef enum {
     IR_HOST_CMD_SEND_DATA = 0x02,   ///< 发送数据
     IR_HOST_CMD_READ_STATUS = 0x03, ///< 读取状态
     IR_HOST_CMD_RESET = 0x04,       ///< 复位从机
-    IR_HOST_CMD_SET_ID = 0x05,      ///< 设置从机模块ID
     IR_HOST_CMD_READ_SENSOR = 0x05, ///< 读取传感器
     IR_HOST_CMD_READ_ALL = 0x06     ///< 读取全部
 } IR_Host_Command_t;

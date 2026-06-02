@@ -94,6 +94,8 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_CAN2_Init();
+
+  // IR_Init moved to Task_Init.c (uses hcan2, with both modules registered)
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */

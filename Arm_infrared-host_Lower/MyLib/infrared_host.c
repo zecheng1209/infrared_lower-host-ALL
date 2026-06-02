@@ -39,17 +39,6 @@ typedef struct {
         uint8_t data_check_result;
     } stats;
 
-    // CRC过滤相关（用于debug查看过滤后的数据）
-    struct {
-        uint8_t filtered_data[8];   // CRC校验通过后的数据
-        uint8_t filtered_len;        // 有效数据长度
-        uint8_t crc_valid;           // CRC校验结果: 1=通过, 0=失败
-        uint8_t received_crc;        // 接收到的CRC值
-        uint8_t calculated_crc;      // 计算得到的CRC值
-        uint32_t crc_error_count;    // CRC错误计数
-        uint32_t crc_pass_count;     // CRC通过计数
-    } crc_debug;
-
     uint8_t data_changed_flag;
 
     uint32_t all_rx_frame_count;
@@ -64,47 +53,9 @@ typedef struct {
     uint8_t history_write_idx;
     uint8_t history_count;
     IR_Debug_RxHistory_t rx_history[IR_DEBUG_RX_HISTORY_SIZE];
-
-    // 多模块去重相关（用于debug查看）
-    struct {
-        uint8_t shared_data[8];          // 共享去重数据
-        uint8_t shared_data_len;         // 共享数据长度
-        uint32_t shared_timestamp;      // 共享数据时间戳
-        uint8_t deduplicated_count;      // 被去重的帧数
-        uint8_t unique_count;           // 唯一的帧数
-        uint8_t first_module_id;        // 第一个收到该数据的模块ID
-        uint8_t has_shared_data;        // 是否有有效共享数据
-    } dedup_debug;
 } IR_Debug_Data_t;
 
 IR_Debug_Data_t ir_debug = {0};
-
-// 多模块去重表（同一时间多模块收到相同数据时，只保留第一个收到的）
-#define IR_DEDUP_WINDOW_MS  50  // 去重时间窗口(ms)，超过此时间的数据视为不同数据
-static struct {
-    uint8_t data[8];
-    uint8_t len;
-    uint32_t timestamp;
-    uint8_t first_module_id;  // 第一个收到该数据的模块ID
-    uint8_t valid;             // 是否有有效数据
-} ir_dedup_table = {0};
-
-// CRC-8/MAXIM校验（与下位机保持一致）
-static uint8_t IR_CRC8(uint8_t *data, uint8_t length)
-{
-    uint8_t crc = 0xFF;
-    for (uint8_t i = 0; i < length; i++) {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x80) {
-                crc = (crc << 1) ^ 0x07;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    return crc;
-}
 
 static TaskHandle_t ir_host_task_handle = NULL;
 
@@ -709,75 +660,33 @@ static void IR_ProcessRxQueue__(void)
             if (module != NULL && rx_frame.dlc >= 1) {
                 uint8_t data_len = rx_frame.dlc;
                 module->data_cache.total_rx_count++;
-
-                // CRC校验说明：
-                // 下位机通过CAN转发时只发送8字节payload（不含红外CRC字节），
-                // CAN总线本身已有硬件CRC保护，因此上位机接收CAN数据帧无需再校验CRC。
-                // 红外层CRC已由下位机在红外接收时完成校验（main.c第245-246行）。
-                // 如果将来需要端到端CRC校验，需修改下位机CAN转发时携带CRC字节。
-                uint8_t crc_valid = 1;  // CAN数据帧默认CRC通过
-
-                if (crc_valid) {
-                    uint32_t now = rx_frame.timestamp;
-                    uint8_t is_dedup = 0;  // 是否被去重
-
-                    // ===== 多模块去重逻辑 =====
-                    if (ir_dedup_table.valid) {
-                        // 检查去重表：数据相同且在时间窗口内
-                        uint32_t time_diff = now - ir_dedup_table.timestamp;
-                        if (time_diff <= IR_DEDUP_WINDOW_MS &&
-                            ir_dedup_table.len == data_len &&
-                            memcmp(ir_dedup_table.data, rx_frame.data, data_len) == 0) {
-                            // 数据相同，在时间窗口内 -> 被去重
-                            is_dedup = 1;
-                            ir_debug.dedup_debug.deduplicated_count++;
-                        }
+                if (data_len > 0) {
+                    bool data_changed = false;
+                    if (module->data_cache.valid &&
+                        data_len <= 8 &&
+                        memcmp(module->data_cache.raw_data, rx_frame.data, data_len) != 0) {
+                        data_changed = true;
                     }
-
-                    if (!is_dedup) {
-                        // 新数据，更新去重表
-                        ir_dedup_table.len = data_len;
-                        memcpy(ir_dedup_table.data, rx_frame.data, data_len > 8 ? 8 : data_len);
-                        ir_dedup_table.timestamp = now;
-                        ir_dedup_table.first_module_id = rx_frame.module_id;
-                        ir_dedup_table.valid = 1;
-                        ir_debug.dedup_debug.unique_count++;
-                        ir_debug.dedup_debug.first_module_id = rx_frame.module_id;
-
-                        // 更新共享去重数据（debug用）
-                        ir_debug.dedup_debug.shared_data_len = data_len;
-                        memcpy(ir_debug.dedup_debug.shared_data, rx_frame.data, data_len > 8 ? 8 : data_len);
-                        ir_debug.dedup_debug.shared_timestamp = now;
-                        ir_debug.dedup_debug.has_shared_data = 1;
-
-                        // 更新模块的data_cache
-                        bool data_changed = false;
-                        if (module->data_cache.valid &&
-                            data_len <= 8 &&
-                            memcmp(module->data_cache.raw_data, rx_frame.data, data_len) != 0) {
-                            data_changed = true;
-                        }
-                        memcpy(module->data_cache.raw_data, rx_frame.data, data_len > 8 ? 8 : data_len);
-                        module->data_cache.update_timestamp = rx_frame.timestamp;
-                        module->data_cache.valid = true;
-                        if (!data_changed) {
-                            if (module->data_cache.consistent_count < 255) module->data_cache.consistent_count++;
-                        } else {
-                            module->data_cache.consistent_count = 1;
-                        }
-                        module->last_response.module_id = rx_frame.module_id;
-                        module->last_response.status = IR_HOST_STATUS_SUCCESS;
-                        module->last_response.length = data_len;
-                        module->last_response.timestamp = rx_frame.timestamp;
-                        module->last_response.valid = true;
-                        if (data_len > 0) memcpy(module->last_response.data, rx_frame.data, data_len);
-                        module->last_rx_time = rx_frame.timestamp;
-                        module->online = true;
-                        module->busy = false;
-                        module->discovered = true;
-                        module->poll_fail_count = 0;
-                        module->consecutive_errors = 0;
+                    memcpy(module->data_cache.raw_data, rx_frame.data, data_len > 8 ? 8 : data_len);
+                    module->data_cache.update_timestamp = rx_frame.timestamp;
+                    module->data_cache.valid = true;
+                    if (!data_changed) {
+                        if (module->data_cache.consistent_count < 255) module->data_cache.consistent_count++;
+                    } else {
+                        module->data_cache.consistent_count = 1;
                     }
+                    module->last_response.module_id = rx_frame.module_id;
+                    module->last_response.status = IR_HOST_STATUS_SUCCESS;
+                    module->last_response.length = data_len;
+                    module->last_response.timestamp = rx_frame.timestamp;
+                    module->last_response.valid = true;
+                    if (data_len > 0) memcpy(module->last_response.data, rx_frame.data, data_len);
+                    module->last_rx_time = rx_frame.timestamp;
+                    module->online = true;
+                    module->busy = false;
+                    module->discovered = true;
+                    module->poll_fail_count = 0;
+                    module->consecutive_errors = 0;
                 }
             }
         }
@@ -879,6 +788,7 @@ static void IR_UpdateOnlineStatus__(void)
 
 static void IR_TaskEntry__(void *argument)
 {
+    IR_Host_RxFrame_t rx_frame;
     (void)argument;
 
     ir_host_context.task_state = IR_HOST_TASK_STATE_DISCOVERY;
@@ -887,8 +797,55 @@ static void IR_TaskEntry__(void *argument)
     ir_host_context.last_poll_time = 0;
 
     for (;;) {
-        // 统一使用 IR_ProcessRxQueue__ 处理接收队列（含CRC校验+去重）
-        IR_ProcessRxQueue__();
+        while (xQueueReceive(ir_host_context.rx_queue, &rx_frame, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (IR_HOST_IS_ACK_FRAME(rx_frame.can_id)) {
+                IR_HandleAckNack__(rx_frame.module_id, rx_frame.can_id, rx_frame.data, rx_frame.dlc);
+            }
+            else if (IR_HOST_IS_DATA_FRAME(rx_frame.can_id)) {
+                IR_Module_Node_t *module = IR_FindModule__(rx_frame.module_id);
+                if (module != NULL && rx_frame.dlc >= 1) {
+                    uint8_t data_len = rx_frame.dlc;
+                    module->data_cache.total_rx_count++;
+                    if (data_len > 0) {
+                        bool data_changed = false;
+                        if (module->data_cache.valid && data_len <= 8 &&
+                            memcmp(module->data_cache.raw_data, rx_frame.data, data_len) != 0) {
+                            data_changed = true;
+                        }
+                        memcpy(module->data_cache.raw_data, rx_frame.data, data_len > 8 ? 8 : data_len);
+                        module->data_cache.update_timestamp = rx_frame.timestamp;
+                        module->data_cache.valid = true;
+                        if (!data_changed) {
+                            if (module->data_cache.consistent_count < 255) module->data_cache.consistent_count++;
+                        } else {
+                            module->data_cache.consistent_count = 1;
+                        }
+                        module->last_response.module_id = rx_frame.module_id;
+                        module->last_response.status = IR_HOST_STATUS_SUCCESS;
+                        module->last_response.length = data_len;
+                        module->last_response.timestamp = rx_frame.timestamp;
+                        module->last_response.valid = true;
+                        if (data_len > 0) memcpy(module->last_response.data, rx_frame.data, data_len);
+                        module->last_rx_time = rx_frame.timestamp;
+                        module->online = true;
+                        module->busy = false;
+                        module->discovered = true;
+                        module->poll_fail_count = 0;
+                        module->consecutive_errors = 0;
+                    }
+                }
+            }
+        }
+
+        // Bus-off 自动恢复保险（即使AutoBusOff=ENABLE也加一层软件保护）
+        if (ir_host_context.hcan != NULL) {
+            uint32_t esr = ir_host_context.hcan->Instance->ESR;
+            if (esr & CAN_ESR_BOFF) {
+                // 检测到 bus-off，重启 CAN
+                HAL_CAN_Stop(ir_host_context.hcan);
+                HAL_CAN_Start(ir_host_context.hcan);
+            }
+        }
 
         switch (ir_host_context.task_state) {
             case IR_HOST_TASK_STATE_DISCOVERY:
@@ -928,7 +885,7 @@ static void IR_TaskEntry__(void *argument)
 }
 
 /* ================================================================
- *          测试任务 (内部)
+ *          测试任务 
  * ================================================================ */
 
 static TaskHandle_t ir_test_task_handle = NULL;
@@ -940,7 +897,7 @@ static void IR_TestTaskEntry__(void *argument)
     CAN_TxHeaderTypeDef tx_header;
     uint32_t tx_mailbox;
 
-    IR_Init(ir_host_context.hcan, (uint8_t[]){IR_HOST_DEFAULT_MODULE_ID}, 1);
+    //IR_Init(ir_host_context.hcan, (uint8_t[]){IR_HOST_DEFAULT_MODULE_ID}, 1);
     vTaskDelay(200);
 
     tx_header.StdId = IR_HOST_CAN_ID_DATA(IR_HOST_DEFAULT_MODULE_ID);

@@ -31,7 +31,6 @@ void rs03_PID_Init() {
 
 }
 
-
 void Motor_Drive(void *param)
 {
   RobStrideEnable(&rs03);
@@ -86,9 +85,6 @@ void CDC_Recv_Cb(uint8_t *src, uint16_t size)
 	if(((Arm_t *)src )->pack_type == 0x01)
 	{
 		memcpy(&arm_Rec_t, src, sizeof(arm_Rec_t));
-		
-		
-		
 		
 		
 			Joint[0].exp_rad = arm_Rec_t.joints[0].rad;
@@ -186,7 +182,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 			raw_can_rx_count++;
 			raw_can_rx_id = rx_header.StdId;
 			memcpy((void*)raw_can_rx_data, rx_data, rx_header.DLC > 8 ? 8 : rx_header.DLC);
-			IR_OnCanRx(&rx_header, rx_data);
+
 		}
 	}
 }
@@ -200,8 +196,8 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
 		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header, rx_data) == HAL_OK) {
 			// IR当前用CAN1，这里只处理RobStride电机
 			RobStrideRecv_Handle(&rs03, hcan, rx_header.StdId, rx_data);
+  		IR_OnCanRx(&rx_header, rx_data);
 		}
 	}
 }
-
 
