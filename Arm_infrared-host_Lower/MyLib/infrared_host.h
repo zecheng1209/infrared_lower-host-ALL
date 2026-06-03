@@ -28,7 +28,7 @@
 #define IR_HOST_ONLINE_TIMEOUT_MS  3000     ///< 在线超时(ms)
 #define IR_HOST_DATA_STALE_MS      500      ///< 数据过期阈值(ms)
 #define IR_HOST_MAX_CRC_ERRORS     5        ///< 最大CRC错误计数
-#define IR_HOST_CONSISTENT_COUNT   3        ///< 数据一致所需连续次数
+#define IR_HOST_VOTE_WINDOW_MS     50       ///< 投票收集窗口(ms)
 
 /* ================================================================
  *                     CAN ID 编码宏，结合了帧类型和模块id的编码
@@ -85,13 +85,25 @@ typedef enum {
 } IR_Host_TaskState_t;
 
 typedef enum {
-    IR_DATA_CHECK_OK = 0,           ///< 数据新鲜且一致
+    IR_DATA_CHECK_OK = 0,           ///< 数据新鲜且有效
     IR_DATA_CHECK_STALE,            ///< 数据过期
     IR_DATA_CHECK_CRC_ERR,          ///< 数据校验错误
-    IR_DATA_CHECK_INCONSISTENT,     ///< 数据不一致
     IR_DATA_CHECK_OFFLINE,          ///< 模块离线
     IR_DATA_CHECK_NO_MODULE         ///< 模块不存在
 } IR_Data_CheckResult_t;
+
+/* ================================================================
+ *                  投票结果
+ * ================================================================ */
+
+typedef struct {
+    uint8_t data[8];            ///< 投票得出的数据
+    uint8_t dlc;                ///< 数据长度
+    bool valid;                 ///< 投票结果是否有效
+    uint8_t agree_count;        ///< 同意该数据的模块数
+    uint8_t total_count;        ///< 参与投票的模块数
+    uint32_t timestamp;         ///< 投票完成时间
+} IR_Vote_Result_t;
 
 /* ================================================================
  *                  内部类型 
@@ -118,7 +130,6 @@ typedef struct {
     uint8_t raw_data[8];
     uint32_t update_timestamp;
     bool valid;
-    uint8_t consistent_count;
     uint8_t crc_error_count;
     uint32_t total_rx_count;
     uint32_t total_crc_error_count;
@@ -160,6 +171,11 @@ typedef struct {
     uint8_t  max_retry;
     uint32_t poll_interval_ms;
     uint32_t online_timeout_ms;
+    // 投票
+    bool vote_window_active;
+    uint32_t vote_window_start_time;
+    IR_Vote_Result_t vote_result;
+    uint32_t total_votes;
 } IR_Host_Context_t;
 
 extern IR_Host_Context_t ir_host_context;
@@ -216,13 +232,18 @@ bool IR_SendAsync(uint8_t module_id, uint8_t *data, uint8_t length);
 
 
 /**
- * @brief  读取模块最新缓存数据
+ * @brief  读取最新可用数据（自动投票）
  *
- * @param[in]   module_id 模块ID, 0xFF=读取第一个在线模块
+ * @param[in]   module_id 模块ID, 0xFF=自动选取最佳数据
  * @param[out]  data      输出缓冲区(8字节), 可NULL
  * @param[out]  length    输出数据实际长度, 可NULL
  * @return true  数据有效
  * @return false 模块不存在/数据无效
+ *
+ * module_id=0xFF 时的选择逻辑:
+ *   1) 多模块在线 → 返回投票结果(多数派数据)
+ *   2) 投票结果过期或无效 → 降级返回第一个在线模块数据
+ *   3) 指定具体模块ID → 返回该模块的原始数据
  *
  * @code
  *   uint8_t buf[8], len;
@@ -275,6 +296,28 @@ IR_Data_CheckResult_t IR_CheckAllModules(void);
 void IR_ForceRediscover(void);
 
 /* ================================================================
+ *         多模块投票
+ * ================================================================ */
+
+/**
+ * @brief  读取投票筛选后的数据
+ *
+ * 多个模块同时接收同一IR信号时，取多数派一致的数据作为可信结果。
+ * 仅1个模块在线时直接返回该模块数据。
+ *
+ * @param[out]  data    输出缓冲区(8字节), 可NULL
+ * @param[out]  length  输出数据长度, 可NULL
+ * @return true  投票结果有效
+ * @return false 无有效投票结果
+ */
+bool IR_ReadVoted(uint8_t *data, uint8_t *length);
+
+/**
+ * @brief  获取投票结果详情（含同意数、参与数等）
+ */
+IR_Vote_Result_t* IR_GetVoteResult(void);
+
+/* ================================================================
  *         精细控制
  * ================================================================ */
 
@@ -312,5 +355,6 @@ void IR_StartTest(CAN_HandleTypeDef *hcan);
 #define IR_Host_ResetModule          IR_ResetTimeout
 #define IR_Host_CheckDataConsistency IR_CheckData
 #define IR_Host_GetModuleData        IR_Read
+#define IR_Host_ReadVoted            IR_ReadVoted
 
 #endif

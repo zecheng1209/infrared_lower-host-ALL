@@ -171,7 +171,7 @@ volatile uint32_t raw_can_rx_count = 0;
 volatile uint32_t raw_can_rx_id = 0;
 volatile uint8_t  raw_can_rx_data[8] = {0};
 
-// CAN1 FIFO0回调 — 红外模块如果接CAN1则在这里处理
+// CAN1 FIFO0回调
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
 	if (hcan->Instance == CAN1)
@@ -182,7 +182,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 			raw_can_rx_count++;
 			raw_can_rx_id = rx_header.StdId;
 			memcpy((void*)raw_can_rx_data, rx_data, rx_header.DLC > 8 ? 8 : rx_header.DLC);
-
+			IR_OnCanRx(&rx_header, rx_data);
 		}
 	}
 }
@@ -194,9 +194,8 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
 		uint8_t rx_data[8];
 		CAN_RxHeaderTypeDef rx_header;
 		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header, rx_data) == HAL_OK) {
-			// IR当前用CAN1，这里只处理RobStride电机
 			RobStrideRecv_Handle(&rs03, hcan, rx_header.StdId, rx_data);
-  		IR_OnCanRx(&rx_header, rx_data);
+			IR_OnCanRx(&rx_header, rx_data);
 		}
 	}
 }

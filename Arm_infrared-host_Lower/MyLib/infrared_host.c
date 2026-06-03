@@ -53,6 +53,14 @@ typedef struct {
     uint8_t history_write_idx;
     uint8_t history_count;
     IR_Debug_RxHistory_t rx_history[IR_DEBUG_RX_HISTORY_SIZE];
+
+    // 投票结果debug
+    uint8_t voted_data[8];
+    uint8_t voted_dlc;
+    uint8_t voted_agree_count;
+    uint8_t voted_total_count;
+    uint32_t vote_count;
+    uint8_t voted_valid;
 } IR_Debug_Data_t;
 
 IR_Debug_Data_t ir_debug = {0};
@@ -70,6 +78,7 @@ static void IR_UpdateOnlineStatus__(void);
 static void IR_TaskEntry__(void *argument);
 static IR_Module_Node_t* IR_FindModule__(uint8_t module_id);
 static IR_Module_Node_t* IR_GetModuleByIndex__(uint8_t index);
+static void IR_PerformVote__(void);
 static void IR_TestTaskEntry__(void *argument);
 
 /* ================================================================
@@ -228,19 +237,40 @@ bool IR_SendAsync(uint8_t module_id, uint8_t *data, uint8_t length)
 
 bool IR_Read(uint8_t module_id, uint8_t *data, uint8_t *length)
 {
-    IR_Module_Node_t *module;
-
-    /* 0xFF = 读取第一个有效模块 */
+    /* 0xFF = 读取最佳可用数据（优先投票结果，降级到单模块） */
     if (module_id == 0xFF) {
-        module = ir_host_context.module_list.head;
+        /* 有新鲜的投票结果 → 直接返回 */
+        if (ir_host_context.vote_result.valid) {
+            uint32_t elapsed = xTaskGetTickCount() - ir_host_context.vote_result.timestamp;
+            if (elapsed <= IR_HOST_DATA_STALE_MS) {
+                if (data != NULL) {
+                    memcpy(data, ir_host_context.vote_result.data, 8);
+                }
+                if (length != NULL) {
+                    *length = ir_host_context.vote_result.dlc;
+                }
+                return true;
+            }
+        }
+        /* 无投票结果或已过期 → 降级到第一个有效模块 */
+        IR_Module_Node_t *module = ir_host_context.module_list.head;
         while (module != NULL) {
             if (module->online && module->data_cache.valid) break;
             module = module->next;
         }
-    } else {
-        module = IR_FindModule__(module_id);
+        if (module == NULL) return false;
+
+        if (data != NULL) {
+            memcpy(data, module->data_cache.raw_data, 8);
+        }
+        if (length != NULL) {
+            *length = module->last_response.length > 8 ? 8 : module->last_response.length;
+        }
+        return true;
     }
 
+    /* 指定模块ID → 读该模块原始数据 */
+    IR_Module_Node_t *module = IR_FindModule__(module_id);
     if (module == NULL || !module->data_cache.valid) return false;
 
     if (data != NULL) {
@@ -249,7 +279,6 @@ bool IR_Read(uint8_t module_id, uint8_t *data, uint8_t *length)
     if (length != NULL) {
         *length = module->last_response.length > 8 ? 8 : module->last_response.length;
     }
-
     return true;
 }
 
@@ -331,7 +360,6 @@ IR_Data_CheckResult_t IR_CheckData(uint8_t module_id)
 
     uint32_t elapsed = xTaskGetTickCount() - module->data_cache.update_timestamp;
     if (elapsed > IR_HOST_DATA_STALE_MS) return IR_DATA_CHECK_STALE;
-    if (module->data_cache.consistent_count < IR_HOST_CONSISTENT_COUNT) return IR_DATA_CHECK_INCONSISTENT;
 
     return IR_DATA_CHECK_OK;
 }
@@ -661,20 +689,9 @@ static void IR_ProcessRxQueue__(void)
                 uint8_t data_len = rx_frame.dlc;
                 module->data_cache.total_rx_count++;
                 if (data_len > 0) {
-                    bool data_changed = false;
-                    if (module->data_cache.valid &&
-                        data_len <= 8 &&
-                        memcmp(module->data_cache.raw_data, rx_frame.data, data_len) != 0) {
-                        data_changed = true;
-                    }
                     memcpy(module->data_cache.raw_data, rx_frame.data, data_len > 8 ? 8 : data_len);
                     module->data_cache.update_timestamp = rx_frame.timestamp;
                     module->data_cache.valid = true;
-                    if (!data_changed) {
-                        if (module->data_cache.consistent_count < 255) module->data_cache.consistent_count++;
-                    } else {
-                        module->data_cache.consistent_count = 1;
-                    }
                     module->last_response.module_id = rx_frame.module_id;
                     module->last_response.status = IR_HOST_STATUS_SUCCESS;
                     module->last_response.length = data_len;
@@ -786,6 +803,98 @@ static void IR_UpdateOnlineStatus__(void)
     xSemaphoreGive(ir_host_context.module_list.mutex);
 }
 
+/* ================================================================
+ *          ★ 多模块投票
+ * ================================================================ */
+
+static void IR_PerformVote__(void)
+{
+    IR_Module_Node_t *modules[IR_HOST_MAX_MODULES];
+    uint8_t n = 0;
+    uint32_t window_start = ir_host_context.vote_window_start_time;
+
+    // 收集窗口期内收到新数据的模块
+    xSemaphoreTake(ir_host_context.module_list.mutex, portMAX_DELAY);
+    IR_Module_Node_t *cur = ir_host_context.module_list.head;
+    while (cur != NULL) {
+        if (cur->data_cache.valid &&
+            cur->data_cache.update_timestamp >= window_start) {
+            if (n < IR_HOST_MAX_MODULES) modules[n++] = cur;
+        }
+        cur = cur->next;
+    }
+    xSemaphoreGive(ir_host_context.module_list.mutex);
+
+    if (n == 0) return;
+
+    // 仅1个模块，直接采用
+    if (n == 1) {
+        memcpy(ir_host_context.vote_result.data, modules[0]->data_cache.raw_data, 8);
+        ir_host_context.vote_result.dlc = modules[0]->last_response.length;
+        ir_host_context.vote_result.valid = true;
+        ir_host_context.vote_result.agree_count = 1;
+        ir_host_context.vote_result.total_count = 1;
+        ir_host_context.vote_result.timestamp = xTaskGetTickCount();
+        ir_host_context.total_votes++;
+        goto update_debug;
+    }
+
+    // 多模块：找多数派（按数据内容分组计数）
+    {
+        uint8_t best_idx = 0;
+        uint8_t best_count = 0;
+
+        for (uint8_t i = 0; i < n; i++) {
+            uint8_t count = 1;
+            for (uint8_t j = i + 1; j < n; j++) {
+                if (modules[i]->last_response.length == modules[j]->last_response.length &&
+                    memcmp(modules[i]->data_cache.raw_data, modules[j]->data_cache.raw_data,
+                           modules[i]->last_response.length) == 0) {
+                    count++;
+                }
+            }
+            if (count > best_count) {
+                best_count = count;
+                best_idx = i;
+            }
+        }
+
+        memcpy(ir_host_context.vote_result.data, modules[best_idx]->data_cache.raw_data, 8);
+        ir_host_context.vote_result.dlc = modules[best_idx]->last_response.length;
+        ir_host_context.vote_result.valid = true;
+        ir_host_context.vote_result.agree_count = best_count;
+        ir_host_context.vote_result.total_count = n;
+        ir_host_context.vote_result.timestamp = xTaskGetTickCount();
+        ir_host_context.total_votes++;
+    }
+
+update_debug:
+    memcpy(ir_debug.voted_data, ir_host_context.vote_result.data, 8);
+    ir_debug.voted_dlc = ir_host_context.vote_result.dlc;
+    ir_debug.voted_agree_count = ir_host_context.vote_result.agree_count;
+    ir_debug.voted_total_count = ir_host_context.vote_result.total_count;
+    ir_debug.vote_count = ir_host_context.total_votes;
+    ir_debug.voted_valid = ir_host_context.vote_result.valid ? 1 : 0;
+}
+
+bool IR_ReadVoted(uint8_t *data, uint8_t *length)
+{
+    if (!ir_host_context.vote_result.valid) return false;
+
+    if (data != NULL) {
+        memcpy(data, ir_host_context.vote_result.data, 8);
+    }
+    if (length != NULL) {
+        *length = ir_host_context.vote_result.dlc;
+    }
+    return true;
+}
+
+IR_Vote_Result_t* IR_GetVoteResult(void)
+{
+    return &ir_host_context.vote_result;
+}
+
 static void IR_TaskEntry__(void *argument)
 {
     IR_Host_RxFrame_t rx_frame;
@@ -807,19 +916,9 @@ static void IR_TaskEntry__(void *argument)
                     uint8_t data_len = rx_frame.dlc;
                     module->data_cache.total_rx_count++;
                     if (data_len > 0) {
-                        bool data_changed = false;
-                        if (module->data_cache.valid && data_len <= 8 &&
-                            memcmp(module->data_cache.raw_data, rx_frame.data, data_len) != 0) {
-                            data_changed = true;
-                        }
                         memcpy(module->data_cache.raw_data, rx_frame.data, data_len > 8 ? 8 : data_len);
                         module->data_cache.update_timestamp = rx_frame.timestamp;
                         module->data_cache.valid = true;
-                        if (!data_changed) {
-                            if (module->data_cache.consistent_count < 255) module->data_cache.consistent_count++;
-                        } else {
-                            module->data_cache.consistent_count = 1;
-                        }
                         module->last_response.module_id = rx_frame.module_id;
                         module->last_response.status = IR_HOST_STATUS_SUCCESS;
                         module->last_response.length = data_len;
@@ -844,6 +943,76 @@ static void IR_TaskEntry__(void *argument)
                 // 检测到 bus-off，重启 CAN
                 HAL_CAN_Stop(ir_host_context.hcan);
                 HAL_CAN_Start(ir_host_context.hcan);
+            }
+        }
+
+        // ===== 多模块投票窗口检测 =====
+        if (!ir_host_context.vote_window_active) {
+            // 检查是否有模块收到了新数据（比上次投票结果更新）
+            IR_Module_Node_t *cur = ir_host_context.module_list.head;
+            while (cur != NULL) {
+                if (cur->data_cache.valid &&
+                    cur->data_cache.update_timestamp > ir_host_context.vote_result.timestamp) {
+                    ir_host_context.vote_window_active = true;
+                    ir_host_context.vote_window_start_time = cur->data_cache.update_timestamp;
+                    break;
+                }
+                cur = cur->next;
+            }
+        }
+
+        if (ir_host_context.vote_window_active) {
+            uint32_t elapsed = xTaskGetTickCount() - ir_host_context.vote_window_start_time;
+            uint8_t online_cnt = IR_GetOnlineCount();
+
+            // 提前关闭：所有在线模块都已上报
+            bool all_reported = false;
+            if (online_cnt > 0) {
+                uint8_t fresh = 0;
+                IR_Module_Node_t *cur = ir_host_context.module_list.head;
+                while (cur != NULL) {
+                    if (cur->online && cur->data_cache.valid &&
+                        cur->data_cache.update_timestamp >= ir_host_context.vote_window_start_time) {
+                        fresh++;
+                    }
+                    cur = cur->next;
+                }
+                all_reported = (fresh >= online_cnt);
+            }
+
+            if (all_reported || elapsed >= IR_HOST_VOTE_WINDOW_MS) {
+                IR_PerformVote__();
+                ir_host_context.vote_window_active = false;
+            }
+        }
+
+        // ===== 更新 ir_debug 状态字段 =====
+        {
+            ir_debug.task_state = (uint8_t)ir_host_context.task_state;
+            ir_debug.online_count = IR_GetOnlineCount();
+            ir_debug.total_modules = IR_GetModuleCount();
+
+            IR_Module_Node_t *mod = ir_host_context.module_list.head;
+            if (mod != NULL) {
+                ir_debug.mod1.discovered = mod->discovered ? 1 : 0;
+                ir_debug.mod1.online = mod->online ? 1 : 0;
+                ir_debug.mod1.busy = mod->busy ? 1 : 0;
+                ir_debug.mod1.consecutive_errors = mod->consecutive_errors;
+                ir_debug.mod1.total_rx_count = mod->data_cache.total_rx_count;
+                ir_debug.mod1.last_rx_time = mod->last_rx_time;
+                if (mod->data_cache.valid) memcpy(ir_debug.rx_data, mod->data_cache.raw_data, 8);
+                ir_debug.rx_data_len = mod->last_response.length;
+                ir_debug.update_timestamp = mod->data_cache.update_timestamp;
+            }
+
+            mod = mod != NULL ? mod->next : NULL;
+            if (mod != NULL) {
+                ir_debug.mod2.discovered = mod->discovered ? 1 : 0;
+                ir_debug.mod2.online = mod->online ? 1 : 0;
+                ir_debug.mod2.busy = mod->busy ? 1 : 0;
+                ir_debug.mod2.consecutive_errors = mod->consecutive_errors;
+                ir_debug.mod2.total_rx_count = mod->data_cache.total_rx_count;
+                ir_debug.mod2.last_rx_time = mod->last_rx_time;
             }
         }
 
@@ -908,20 +1077,6 @@ static void IR_TestTaskEntry__(void *argument)
 
     for (;;) {
         ir_debug.test_cycle++;
-        ir_debug.task_state = (uint8_t)IR_GetTaskState();
-        ir_debug.online_count = IR_GetOnlineCount();
-        ir_debug.total_modules = IR_GetModuleCount();
-
-        IR_Module_Node_t *mod1 = IR_FindModule__(IR_HOST_DEFAULT_MODULE_ID);
-        if (mod1 != NULL) {
-            ir_debug.mod1.discovered = mod1->discovered ? 1 : 0;
-            ir_debug.mod1.online = mod1->online ? 1 : 0;
-            ir_debug.mod1.busy = mod1->busy ? 1 : 0;
-            ir_debug.mod1.consecutive_errors = mod1->consecutive_errors;
-            ir_debug.mod1.total_rx_count = mod1->data_cache.total_rx_count;
-            ir_debug.mod1.last_rx_time = mod1->last_rx_time;
-            if (mod1->data_cache.valid) memcpy(ir_debug.rx_data, mod1->data_cache.raw_data, 8);
-        }
 
         if (ir_debug.task_state == IR_HOST_TASK_STATE_RUNNING && ir_debug.online_count >= 1) {
             uint32_t now = xTaskGetTickCount();
