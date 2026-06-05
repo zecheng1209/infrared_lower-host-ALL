@@ -28,7 +28,8 @@ infrared_lower-AND-host/
 ```
 
 ## 模块说明
-
+！！  
+命名规则，两块大蓝都并联了120欧姆电阻，为0x10，大黑为0x11，大红为0x12，小黑为0x13
 ### 1. Arm_infrared-host_Lower（上位机）
 
 - **主控芯片**：STM32F407VETx
