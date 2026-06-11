@@ -7,11 +7,13 @@ extern uint8_t ready;
 
 Joint_t Joint[5];
 int16_t can_buf[4] = {0};
+uint8_t ir_buf[8], ir_len,   ir_buf0[8], ir_len0,   ir_buf1[8], ir_len1,   ir_buf2[8], ir_len2;
+uint8_t ir_txdata[8] = {0x01, 0x02, 0x02, 0x04, 0x05, 0x06, 0x07, 0x08};
 
 uint8_t enable_Joint[5] = {1,1,1,1,1};//1,1,1,1,1
 
 TaskHandle_t Motor_Drive_Handle;
-
+TaskHandle_t IR_Host_Task_Handle;
 RobStride_t rs03={.hcan=&hcan2,.motor_id=0x02,.type= RobStride_03 };
 
 
@@ -30,6 +32,23 @@ void rs03_PID_Init() {
 	rs03_pos_pid.output_limit = 50.0f;
 
 }
+
+void IR_Host_Task(void *param)
+{
+	TickType_t Last_wake_time = xTaskGetTickCount();
+	for(;;)
+	{
+//		ir_txdata[3]++;
+//		IR_SendAsync(0x12,ir_txdata,8);
+
+	  
+	  
+	  
+	  vTaskDelayUntil(&Last_wake_time, pdMS_TO_TICKS(2000));
+	}
+}
+
+
 
 void Motor_Drive(void *param)
 {
@@ -59,12 +78,20 @@ void Motor_Drive(void *param)
 		// PID_Control(Joint[3].Rs_motor.state.rad, 	Joint[3].exp_rad + Joint[3].pos_offset, &Joint[3].pos_pid);
 		// PID_Control(Joint[3].Rs_motor.state.omega, Joint[3].pos_pid.pid_out + Joint[3].exp_omega, &Joint[3].vel_pid);
 //		  RobStrideTorqueControl(&rs03,rs03_torque);
-    RobStrideMotionControl(&rs03, 0x02, rs03_torque, rs03_rad, rs03_omega, rs03_kp, rs03_kd);
+    //RobStrideMotionControl(&rs03, 0x02, rs03_torque, rs03_rad, rs03_omega, rs03_kp, rs03_kd);
 
 		// PID_Control(Joint[4].RM_motor.actual_pos, Joint[4].exp_rad - Joint[4].pos_offset, &Joint[4].RM_motor.pos_pid);
 		// PID_Control(Joint[4].RM_motor.motor.Speed, Joint[4].RM_motor.pos_pid.pid_out, &Joint[4].RM_motor.vel_pid);
 		// can_buf[0] = Joint[4].RM_motor.vel_pid.pid_out * enable_Joint[4];
 		// MotorSend(&hcan2 ,0x200, can_buf);
+		
+
+		IR_Read(0x10, &ir_buf0[0], &ir_len0);
+		IR_Read(0x11, &ir_buf1[0], &ir_len1);
+		IR_Read(0x12, &ir_buf2[0], &ir_len2);
+		
+		IR_Read(0x13, &ir_buf[0], &ir_len);
+
 		
 		vTaskDelayUntil(&Last_wake_time, pdMS_TO_TICKS(2));
 	}
@@ -179,10 +206,10 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 		uint8_t rx_data[8];
 		CAN_RxHeaderTypeDef rx_header;
 		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
+			IR_OnCanRx(&rx_header, rx_data);
 			raw_can_rx_count++;
 			raw_can_rx_id = rx_header.StdId;
 			memcpy((void*)raw_can_rx_data, rx_data, rx_header.DLC > 8 ? 8 : rx_header.DLC);
-			IR_OnCanRx(&rx_header, rx_data);
 		}
 	}
 }

@@ -100,6 +100,26 @@ volatile uint32_t dbg_ir_rx_data = 0;
 volatile uint32_t dbg_ir_rx_ack = 0;
 volatile uint32_t dbg_can_data_sent = 0;
 volatile uint32_t dbg_can_ack_sent = 0;
+
+// ===== 可靠发送状态机（非阻塞，用于 RELIABLE_DATA 帧） =====
+#define IR_RELIABLE_MAX_RETRY   2       // 红外重传次数
+#define IR_RELIABLE_ACK_TIMEOUT 100    // 等待红外ACK超时(ms)
+
+typedef enum {
+    IR_RELIABLE_IDLE = 0,       // 空闲
+    IR_RELIABLE_SENDING,        // 红外正在发送
+    IR_RELIABLE_WAIT_ACK,       // 等待红外ACK
+    IR_RELIABLE_RETRY_WAIT,     // 重试间隔等待
+} IR_Reliable_State_t;
+
+typedef struct {
+    IR_Reliable_State_t state;
+    uint8_t  data[8];              // 待发送数据
+    uint8_t  retry_count;          // 已重试次数
+    uint32_t state_enter_time;     // 进入当前状态的时间
+} IR_Reliable_Context_t;
+
+IR_Reliable_Context_t ir_reliable = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -214,10 +234,10 @@ while (1)
         {
             uint8_t rx_module_id = IR_HOST_CAN_ID_GET_MODULE(slot->can_id);
 
-            // DATA帧 → 回CAN ACK + 入队等红外空闲时转发
-            if (rx_module_id == my_module_id && can_to_ir_count < CAN_TO_IR_QUEUE_SIZE)
+            // DATA帧 → 单播或广播(0x00)都接受，回CAN ACK + 入队等红外空闲时转发
+            if ((rx_module_id == my_module_id || rx_module_id == 0x00) && can_to_ir_count < CAN_TO_IR_QUEUE_SIZE)
             {
-                // ★ 错峰：按模块ID延迟响应ACK
+                // ★ 错峰：按模块ID延迟响应ACK，避免多模块同时抢占总线
                 HAL_Delay((my_module_id & 0x0F) * IR_CAN_STAGGER_BASE_MS);
 
                 // 先回CAN ACK，告诉上位机已收到
@@ -231,6 +251,26 @@ while (1)
                 ir_slot->valid = 1;
                 can_to_ir_head = (can_to_ir_head + 1) % CAN_TO_IR_QUEUE_SIZE;
                 can_to_ir_count++;
+                dbg_can_data_received++;
+            }
+        }
+        else if (IR_HOST_IS_RELIABLE_DATA_FRAME(slot->can_id) && slot->dlc >= 1)
+        {
+            uint8_t rx_module_id = IR_HOST_CAN_ID_GET_MODULE(slot->can_id);
+
+            // RELIABLE_DATA帧 → 不立即回CAN ACK，等红外投递成功后再回
+            if ((rx_module_id == my_module_id || rx_module_id == 0x00) &&
+                ir_reliable.state == IR_RELIABLE_IDLE)
+            {
+                // ★ 错峰延迟
+                HAL_Delay((my_module_id & 0x0F) * IR_CAN_STAGGER_BASE_MS);
+
+                // 保存数据，启动可靠发送状态机
+                memset(ir_reliable.data, 0, 8);
+                memcpy(ir_reliable.data, (const void *)slot->data, slot->dlc > 8 ? 8 : slot->dlc);
+                ir_reliable.retry_count = 0;
+                ir_reliable.state = IR_RELIABLE_SENDING;
+                ir_reliable.state_enter_time = HAL_GetTick();
                 dbg_can_data_received++;
             }
         }
@@ -258,6 +298,97 @@ while (1)
                 dbg_ir_tx_from_can++;
             }
         }
+    }
+
+    // ====================================================================
+    //  第2.5步: 可靠发送状态机（非阻塞，用于 RELIABLE_DATA 帧）
+    //  流程: 发红外 → 等ACK → 成功回CAN ACK / 失败重试 → 超限回CAN NACK
+    // ====================================================================
+    switch (ir_reliable.state)
+    {
+        case IR_RELIABLE_IDLE:
+            break;
+
+        case IR_RELIABLE_SENDING:
+            // 尝试发送红外
+            if (!IR_IsTXBusy())
+            {
+                // 清除之前的ACK标志
+                ir_ack_received_flag = 0;
+                ir_ack_status = 0;
+
+                if (IR_SendData(ir_reliable.data, 8))
+                {
+                    ir_reliable.state = IR_RELIABLE_WAIT_ACK;
+                    ir_reliable.state_enter_time = HAL_GetTick();
+                    dbg_ir_tx_from_can++;
+                }
+            }
+            break;
+
+        case IR_RELIABLE_WAIT_ACK:
+            // 检查红外ACK
+            if (ir_ack_received_flag)
+            {
+                ir_ack_received_flag = 0;
+                if (ir_ack_status == 1)
+                {
+                    // 红外ACK → 回CAN ACK，投递成功
+                    CAN_SendFrame(IR_HOST_CAN_ID_ACK(my_module_id),
+                                  (uint8_t[]){IR_ACK_MAGIC, IR_ACK_MAGIC}, 2);
+                    dbg_can_ack_sent++;
+                    ir_reliable.state = IR_RELIABLE_IDLE;
+                }
+                else
+                {
+                    // 红外NACK → 重试
+                    ir_reliable.retry_count++;
+                    if (ir_reliable.retry_count <= IR_RELIABLE_MAX_RETRY)
+                    {
+                        ir_reliable.state = IR_RELIABLE_RETRY_WAIT;
+                        ir_reliable.state_enter_time = HAL_GetTick();
+                    }
+                    else
+                    {
+                        // 重试耗尽 → 回CAN NACK
+                        CAN_SendFrame(IR_HOST_CAN_ID_ACK(my_module_id),
+                                      (uint8_t[]){IR_NACK_MAGIC, IR_NACK_MAGIC}, 2);
+                        dbg_can_ack_sent++;
+                        ir_reliable.state = IR_RELIABLE_IDLE;
+                    }
+                }
+            }
+            else
+            {
+                // 超时检查
+                if ((HAL_GetTick() - ir_reliable.state_enter_time) >= IR_RELIABLE_ACK_TIMEOUT)
+                {
+                    ir_reliable.retry_count++;
+                    if (ir_reliable.retry_count <= IR_RELIABLE_MAX_RETRY)
+                    {
+                        ir_reliable.state = IR_RELIABLE_RETRY_WAIT;
+                        ir_reliable.state_enter_time = HAL_GetTick();
+                    }
+                    else
+                    {
+                        // 重试耗尽 → 回CAN NACK
+                        CAN_SendFrame(IR_HOST_CAN_ID_ACK(my_module_id),
+                                      (uint8_t[]){IR_NACK_MAGIC, IR_NACK_MAGIC}, 2);
+                        dbg_can_ack_sent++;
+                        ir_reliable.state = IR_RELIABLE_IDLE;
+                    }
+                }
+            }
+            break;
+
+        case IR_RELIABLE_RETRY_WAIT:
+            // 重试间隔10ms
+            if ((HAL_GetTick() - ir_reliable.state_enter_time) >= 10)
+            {
+                ir_reliable.state = IR_RELIABLE_SENDING;
+                ir_reliable.state_enter_time = HAL_GetTick();
+            }
+            break;
     }
 
     // ====================================================================

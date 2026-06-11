@@ -11,7 +11,7 @@
 #include <stdbool.h>
 
 // 红外时序定义 (NEC标准的一半 - 高速模式)
-#define IR_FREQUENCY    38000
+#define IR_FREQUENCY    38000  //38kHZ的红外波
 #define START_PULSE_LEN 4500  // 起始信号：4.5ms高电平 (NEC标准9ms的一半)  9000  
 #define START_SPACE_LEN 2250  // 起始信号：2.25ms低电平 (NEC标准4.5ms的一半)  4500  
 #define BIT_ONE_HIGH    280   // 1的高电平：280us (NEC标准560us的一半)  560  
@@ -29,6 +29,7 @@
 // 自发自收过滤定义（关键！用于近距离发送接收隔离）
 #define IR_RX_SELF_FILTER_MS    80      // 发送后冷却期（毫秒），此期间忽略接收数据
 #define IR_ACK_FILTER_MS        40      // ACK/NACK帧的冷却期（更短，因为只有2字节）
+#define IR_TX_GUARD_MS          5       // 发送完成后保护期（毫秒），防止尾抖触发捕获
 
 // ACK机制定义
 #define IR_ACK_TIMEOUT_MS       100     // 等待ACK超时时间（毫秒）
@@ -38,6 +39,7 @@
 
 // 模块ID定义（每个模块需要设置不同的ID，用于上位机区分）//////////////////////////////////////////////////////////////////////////////
 #define IR_MODULE_ID            0x10 //             模块ID (10++)
+
 
 
 // 引脚定义
@@ -116,22 +118,25 @@ const char* IR_DebugGetFrameTypeStr(uint8_t idx);
 
 
 // 与上位机infrared_host.h保持一致的CAN ID编码方案
-// 11位标准CAN ID: [10:8]=帧类型(1=CMD/2=DATA/3=ACK), [7:0]=模块ID
-#define IR_HOST_CAN_TYPE_CMD   1
-#define IR_HOST_CAN_TYPE_DATA  2
-#define IR_HOST_CAN_TYPE_ACK   3
+// 11位标准CAN ID: [10:8]=帧类型(1=CMD/2=DATA/3=ACK/4=RELIABLE_DATA), [7:0]=模块ID
+#define IR_HOST_CAN_TYPE_CMD           1
+#define IR_HOST_CAN_TYPE_DATA          2
+#define IR_HOST_CAN_TYPE_ACK           3
+#define IR_HOST_CAN_TYPE_RELIABLE_DATA 4   ///< 可靠数据帧：下位机等红外投递成功后才回CAN ACK
 
 #define IR_HOST_CAN_ID_BUILD(type, module_id)  (((uint32_t)(type) << 8) | (uint32_t)(module_id))
 #define IR_HOST_CAN_ID_GET_TYPE(can_id)        ((uint8_t)((can_id) >> 8))
 #define IR_HOST_CAN_ID_GET_MODULE(can_id)      ((uint8_t)((can_id) & 0xFF))
 
-#define IR_HOST_IS_CMD_FRAME(can_id)   (IR_HOST_CAN_ID_GET_TYPE(can_id) == IR_HOST_CAN_TYPE_CMD)
-#define IR_HOST_IS_DATA_FRAME(can_id)  (IR_HOST_CAN_ID_GET_TYPE(can_id) == IR_HOST_CAN_TYPE_DATA)
-#define IR_HOST_IS_ACK_FRAME(can_id)   (IR_HOST_CAN_ID_GET_TYPE(can_id) == IR_HOST_CAN_TYPE_ACK)
+#define IR_HOST_IS_CMD_FRAME(can_id)           (IR_HOST_CAN_ID_GET_TYPE(can_id) == IR_HOST_CAN_TYPE_CMD)
+#define IR_HOST_IS_DATA_FRAME(can_id)          (IR_HOST_CAN_ID_GET_TYPE(can_id) == IR_HOST_CAN_TYPE_DATA)
+#define IR_HOST_IS_ACK_FRAME(can_id)           (IR_HOST_CAN_ID_GET_TYPE(can_id) == IR_HOST_CAN_TYPE_ACK)
+#define IR_HOST_IS_RELIABLE_DATA_FRAME(can_id) (IR_HOST_CAN_ID_GET_TYPE(can_id) == IR_HOST_CAN_TYPE_RELIABLE_DATA)
 
 #define IR_HOST_CAN_ID_COMMAND(module_id)  IR_HOST_CAN_ID_BUILD(IR_HOST_CAN_TYPE_CMD, module_id)
 #define IR_HOST_CAN_ID_DATA(module_id)     IR_HOST_CAN_ID_BUILD(IR_HOST_CAN_TYPE_DATA, module_id)
 #define IR_HOST_CAN_ID_ACK(module_id)      IR_HOST_CAN_ID_BUILD(IR_HOST_CAN_TYPE_ACK, module_id)
+#define IR_HOST_CAN_ID_RELIABLE_DATA(module_id) IR_HOST_CAN_ID_BUILD(IR_HOST_CAN_TYPE_RELIABLE_DATA, module_id)
 
 // 与上位机保持一致的命令码
 #define IR_HOST_CMD_PING         0x01

@@ -22,13 +22,15 @@ typedef struct {
     uint8_t total_modules;
 
     struct {
+        uint8_t module_id;
         uint8_t discovered;
         uint8_t online;
         uint8_t busy;
         uint8_t consecutive_errors;
         uint32_t total_rx_count;
         uint32_t last_rx_time;
-    } mod1, mod2;
+    } mods[IR_HOST_MAX_MODULES];
+    uint8_t mod_count;
 
     struct {
         uint32_t tx_success_count;
@@ -73,11 +75,13 @@ static void IR_ProcessRxQueue__(void);
 static void IR_HandleAckNack__(uint8_t module_id, uint32_t id, uint8_t *data, uint8_t dlc);
 static void IR_EnqueueRxFrame__(uint32_t can_id, uint8_t *data, uint8_t dlc);
 static void IR_DiscoveryPhase__(void);
-static void IR_PollModule__(IR_Module_Node_t *module);
+static void IR_PollModuleById__(uint8_t module_id);
 static void IR_UpdateOnlineStatus__(void);
 static void IR_TaskEntry__(void *argument);
 static IR_Module_Node_t* IR_FindModule__(uint8_t module_id);
+static IR_Module_Node_t* IR_FindModuleByIndexNoLock__(uint8_t index);
 static IR_Module_Node_t* IR_GetModuleByIndex__(uint8_t index);
+static void IR_PollModuleById__(uint8_t module_id);
 static void IR_PerformVote__(void);
 static void IR_TestTaskEntry__(void *argument);
 
@@ -144,9 +148,19 @@ bool IR_SendRetry(uint8_t module_id, uint8_t *data, uint8_t length, uint8_t retr
     uint32_t timeout_ms = ir_host_context.can_timeout_ms;
 
     for (uint8_t r = 0; r < retry; r++) {
-        while (module->busy) {
-            IR_ProcessRxQueue__();
-            vTaskDelay(pdMS_TO_TICKS(10));
+        // 等待上一轮的 busy 被清除（捕获超时后迟到到达的 ACK）
+        {
+            uint32_t busy_wait_start = xTaskGetTickCount();
+            while (module->busy) {
+                IR_ProcessRxQueue__();
+                // 安全超时：如果下位机离线，ACK 永远不会来，不能永远卡在这
+                if ((xTaskGetTickCount() - busy_wait_start) > timeout_ms) {
+                    module->busy = false;
+                    module->status = IR_HOST_STATUS_TIMEOUT;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         }
 
         module->status = IR_HOST_STATUS_IDLE;
@@ -175,6 +189,12 @@ bool IR_SendRetry(uint8_t module_id, uint8_t *data, uint8_t length, uint8_t retr
                     if (module->status == IR_HOST_STATUS_NACK) break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            // 超时：清除 busy，下轮重试可以正常发起
+            if (module->busy) {
+                module->busy = false;
+                module->status = IR_HOST_STATUS_TIMEOUT;
             }
         } else {
             module->busy = false;
@@ -210,7 +230,7 @@ bool IR_SendAsync(uint8_t module_id, uint8_t *data, uint8_t length)
     memset(tx_data, 0, 8);
     memcpy(tx_data, data, length);
 
-    tx_header.StdId = IR_HOST_CAN_ID_DATA(module_id);
+    tx_header.StdId = IR_HOST_CAN_ID_RELIABLE_DATA(module_id);
     tx_header.ExtId = 0;
     tx_header.IDE = CAN_ID_STD;
     tx_header.RTR = CAN_RTR_DATA;
@@ -237,39 +257,7 @@ bool IR_SendAsync(uint8_t module_id, uint8_t *data, uint8_t length)
 
 bool IR_Read(uint8_t module_id, uint8_t *data, uint8_t *length)
 {
-    /* 0xFF = 读取最佳可用数据（优先投票结果，降级到单模块） */
-    if (module_id == 0xFF) {
-        /* 有新鲜的投票结果 → 直接返回 */
-        if (ir_host_context.vote_result.valid) {
-            uint32_t elapsed = xTaskGetTickCount() - ir_host_context.vote_result.timestamp;
-            if (elapsed <= IR_HOST_DATA_STALE_MS) {
-                if (data != NULL) {
-                    memcpy(data, ir_host_context.vote_result.data, 8);
-                }
-                if (length != NULL) {
-                    *length = ir_host_context.vote_result.dlc;
-                }
-                return true;
-            }
-        }
-        /* 无投票结果或已过期 → 降级到第一个有效模块 */
-        IR_Module_Node_t *module = ir_host_context.module_list.head;
-        while (module != NULL) {
-            if (module->online && module->data_cache.valid) break;
-            module = module->next;
-        }
-        if (module == NULL) return false;
-
-        if (data != NULL) {
-            memcpy(data, module->data_cache.raw_data, 8);
-        }
-        if (length != NULL) {
-            *length = module->last_response.length > 8 ? 8 : module->last_response.length;
-        }
-        return true;
-    }
-
-    /* 指定模块ID → 读该模块原始数据 */
+    /* 指定模块ID → 读该模块原始数据（无投票） */
     IR_Module_Node_t *module = IR_FindModule__(module_id);
     if (module == NULL || !module->data_cache.valid) return false;
 
@@ -322,7 +310,7 @@ void IR_OnCanRx(CAN_RxHeaderTypeDef *rx_header, uint8_t *rx_data)
 
     if (IR_HOST_IS_ACK_FRAME(rx_header->StdId)) {
         ir_debug.ack_frame_count++;
-    } else if (IR_HOST_IS_DATA_FRAME(rx_header->StdId)) {
+    } else if (IR_HOST_IS_DATA_FRAME(rx_header->StdId) || IR_HOST_IS_RELIABLE_DATA_FRAME(rx_header->StdId)) {
         ir_debug.data_frame_count++;
     } else {
         ir_debug.other_frame_count++;
@@ -482,13 +470,28 @@ IR_Data_CheckResult_t IR_CheckAllModules(void)
 {
     IR_Data_CheckResult_t worst = IR_DATA_CHECK_OK;
     bool found = false;
+
+    xSemaphoreTake(ir_host_context.module_list.mutex, portMAX_DELAY);
     IR_Module_Node_t *current = ir_host_context.module_list.head;
     while (current != NULL) {
         found = true;
-        IR_Data_CheckResult_t r = IR_CheckData(current->module_id);
+        IR_Data_CheckResult_t r;
+
+        /* 内联判断，避免调用 IR_CheckData → IR_FindModule__ 嵌套加锁死锁 */
+        if (!current->online || !current->discovered)
+            r = IR_DATA_CHECK_OFFLINE;
+        else if (!current->data_cache.valid)
+            r = IR_DATA_CHECK_CRC_ERR;
+        else if ((xTaskGetTickCount() - current->data_cache.update_timestamp) > IR_HOST_DATA_STALE_MS)
+            r = IR_DATA_CHECK_STALE;
+        else
+            r = IR_DATA_CHECK_OK;
+
         if (r > worst) worst = r;
         current = current->next;
     }
+    xSemaphoreGive(ir_host_context.module_list.mutex);
+
     return found ? worst : IR_DATA_CHECK_NO_MODULE;
 }
 
@@ -653,6 +656,15 @@ static IR_Module_Node_t* IR_GetModuleByIndex__(uint8_t index)
     return current;
 }
 
+static IR_Module_Node_t* IR_FindModuleByIndexNoLock__(uint8_t index)
+{
+    /* 调用者必须持有 module_list.mutex */
+    IR_Module_Node_t *m = ir_host_context.module_list.head;
+    for (uint8_t i = 0; i < index && m != NULL; i++)
+        m = m->next;
+    return m;
+}
+
 static void IR_HandleAckNack__(uint8_t module_id, uint32_t id, uint8_t *data, uint8_t dlc)
 {
     if (IR_HOST_IS_ACK_FRAME(id)) {
@@ -683,7 +695,7 @@ static void IR_ProcessRxQueue__(void)
     while (xQueueReceive(ir_host_context.rx_queue, &rx_frame, 0) == pdTRUE) {
         if (IR_HOST_IS_ACK_FRAME(rx_frame.can_id)) {
             IR_HandleAckNack__(rx_frame.module_id, rx_frame.can_id, rx_frame.data, rx_frame.dlc);
-        } else if (IR_HOST_IS_DATA_FRAME(rx_frame.can_id)) {
+        } else if (IR_HOST_IS_DATA_FRAME(rx_frame.can_id) || IR_HOST_IS_RELIABLE_DATA_FRAME(rx_frame.can_id)) {
             IR_Module_Node_t *module = IR_FindModule__(rx_frame.module_id);
             if (module != NULL && rx_frame.dlc >= 1) {
                 uint8_t data_len = rx_frame.dlc;
@@ -721,16 +733,30 @@ static void IR_DiscoveryPhase__(void)
         return;
     }
 
-    IR_Module_Node_t *module = IR_GetModuleByIndex__(discover_index);
-    if (module != NULL && !module->discovered) {
-        if (!module->busy && (now - module->last_tx_time) > ir_host_context.poll_interval_ms) {
-            if (IR_PingTimeout(module->module_id, 200)) {
+    /* 锁内检查条件，提取 module_id 后再释放锁，避免跨锁使用裸指针 */
+    uint8_t target_id = 0;
+    xSemaphoreTake(ir_host_context.module_list.mutex, portMAX_DELAY);
+    {
+        IR_Module_Node_t *m = IR_FindModuleByIndexNoLock__(discover_index);
+        if (m != NULL && !m->discovered && !m->busy &&
+            (now - m->last_tx_time) > ir_host_context.poll_interval_ms) {
+            target_id = m->module_id;
+        }
+    }
+    xSemaphoreGive(ir_host_context.module_list.mutex);
+
+    if (target_id != 0) {
+        if (IR_PingTimeout(target_id, 200)) {
+            IR_Module_Node_t *module = IR_FindModule__(target_id);
+            if (module != NULL) {
                 module->discovered = true;
                 module->online = true;
                 module->last_rx_time = xTaskGetTickCount();
-            } else {
-                module->poll_fail_count++;
             }
+        } else {
+            IR_Module_Node_t *module = IR_FindModule__(target_id);
+            if (module != NULL)
+                module->poll_fail_count++;
         }
     }
 
@@ -740,25 +766,42 @@ static void IR_DiscoveryPhase__(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
-static void IR_PollModule__(IR_Module_Node_t *module)
+static void IR_PollModuleById__(uint8_t module_id)
 {
-    if (module == NULL || module->busy) return;
-
     uint32_t now = xTaskGetTickCount();
+    IR_Module_Node_t *module;
+
+    /* 检查忙标志 */
+    module = IR_FindModule__(module_id);
+    if (module == NULL) return;
+
+    // 模块离线且busy超时（CAN_TIMEOUT_MS），强制清除busy防止死锁
+    if (module->busy && !module->online &&
+        (now - module->last_tx_time) > ir_host_context.can_timeout_ms) {
+        module->busy = false;
+        module->status = IR_HOST_STATUS_TIMEOUT;
+    }
+    if (module->busy) return;
 
     if (!module->online || !module->discovered) {
         if (now - module->last_tx_time > ir_host_context.poll_interval_ms * 2) {
-            if (IR_PingTimeout(module->module_id, 300)) {
-                module->discovered = true;
-                module->online = true;
-                module->last_rx_time = xTaskGetTickCount();
+            if (IR_PingTimeout(module_id, 300)) {
+                module = IR_FindModule__(module_id);
+                if (module != NULL) {
+                    module->discovered = true;
+                    module->online = true;
+                    module->last_rx_time = xTaskGetTickCount();
+                }
             } else {
-                module->poll_fail_count++;
-                module->consecutive_errors++;
-                if (module->consecutive_errors > 10) {
-                    module->online = false;
-                    module->discovered = false;
-                    module->data_cache.valid = false;
+                module = IR_FindModule__(module_id);
+                if (module != NULL) {
+                    module->poll_fail_count++;
+                    module->consecutive_errors++;
+                    if (module->consecutive_errors > 10) {
+                        module->online = false;
+                        module->discovered = false;
+                        module->data_cache.valid = false;
+                    }
                 }
             }
         }
@@ -768,15 +811,21 @@ static void IR_PollModule__(IR_Module_Node_t *module)
             return;
         }
         if (now - module->last_tx_time >= ir_host_context.poll_interval_ms) {
-            if (IR_ReadStatus(module->module_id, NULL, 300)) {
-                module->consecutive_errors = 0;
-                module->last_rx_time = xTaskGetTickCount();
+            if (IR_ReadStatus(module_id, NULL, 300)) {
+                module = IR_FindModule__(module_id);
+                if (module != NULL) {
+                    module->consecutive_errors = 0;
+                    module->last_rx_time = xTaskGetTickCount();
+                }
             } else {
-                module->poll_fail_count++;
-                module->consecutive_errors++;
-                if (module->consecutive_errors > 5) {
-                    module->online = false;
-                    module->data_cache.valid = false;
+                module = IR_FindModule__(module_id);
+                if (module != NULL) {
+                    module->poll_fail_count++;
+                    module->consecutive_errors++;
+                    if (module->consecutive_errors > 5) {
+                        module->online = false;
+                        module->data_cache.valid = false;
+                    }
                 }
             }
         }
@@ -794,6 +843,10 @@ static void IR_UpdateOnlineStatus__(void)
         if (current->online && (now - current->last_rx_time) > ir_host_context.online_timeout_ms) {
             current->online = false;
             current->data_cache.valid = false;
+            // 模块离线时必须清除busy，否则轮询函数会因busy=1直接跳过该模块，
+            // 导致busy永远无法被ACK/数据帧清除（死锁）
+            current->busy = false;
+            current->status = IR_HOST_STATUS_TIMEOUT;
         }
         if (current->data_cache.valid && (now - current->data_cache.update_timestamp) > IR_HOST_DATA_STALE_MS * 3) {
             current->data_cache.valid = false;
@@ -890,6 +943,46 @@ bool IR_ReadVoted(uint8_t *data, uint8_t *length)
     return true;
 }
 
+uint8_t IR_ReadAll(IR_ReadAllResult_t *results, uint8_t max_results)
+{
+    if (results == NULL || max_results == 0) return 0;
+    memset(results, 0, max_results * sizeof(IR_ReadAllResult_t));
+
+    uint8_t result_count = 0;
+
+    xSemaphoreTake(ir_host_context.module_list.mutex, portMAX_DELAY);
+    IR_Module_Node_t *cur = ir_host_context.module_list.head;
+
+    while (cur != NULL && result_count < max_results) {
+        if (cur->data_cache.valid) {
+            uint8_t dlc = cur->last_response.length > 8 ? 8 : cur->last_response.length;
+            if (dlc == 0) dlc = 8;
+
+            /* 查重：是否已存在相同数据 */
+            bool found = false;
+            for (uint8_t i = 0; i < result_count; i++) {
+                if (memcmp(results[i].data, cur->data_cache.raw_data, 8) == 0) {
+                    results[i].matched_module_count++;
+                    if (dlc > results[i].dlc) results[i].dlc = dlc;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                memcpy(results[result_count].data, cur->data_cache.raw_data, 8);
+                results[result_count].dlc = dlc;
+                results[result_count].matched_module_count = 1;
+                result_count++;
+            }
+        }
+        cur = cur->next;
+    }
+
+    xSemaphoreGive(ir_host_context.module_list.mutex);
+    return result_count;
+}
+
 IR_Vote_Result_t* IR_GetVoteResult(void)
 {
     return &ir_host_context.vote_result;
@@ -910,7 +1003,7 @@ static void IR_TaskEntry__(void *argument)
             if (IR_HOST_IS_ACK_FRAME(rx_frame.can_id)) {
                 IR_HandleAckNack__(rx_frame.module_id, rx_frame.can_id, rx_frame.data, rx_frame.dlc);
             }
-            else if (IR_HOST_IS_DATA_FRAME(rx_frame.can_id)) {
+            else if (IR_HOST_IS_DATA_FRAME(rx_frame.can_id) || IR_HOST_IS_RELIABLE_DATA_FRAME(rx_frame.can_id)) {
                 IR_Module_Node_t *module = IR_FindModule__(rx_frame.module_id);
                 if (module != NULL && rx_frame.dlc >= 1) {
                     uint8_t data_len = rx_frame.dlc;
@@ -993,26 +1086,23 @@ static void IR_TaskEntry__(void *argument)
             ir_debug.total_modules = IR_GetModuleCount();
 
             IR_Module_Node_t *mod = ir_host_context.module_list.head;
-            if (mod != NULL) {
-                ir_debug.mod1.discovered = mod->discovered ? 1 : 0;
-                ir_debug.mod1.online = mod->online ? 1 : 0;
-                ir_debug.mod1.busy = mod->busy ? 1 : 0;
-                ir_debug.mod1.consecutive_errors = mod->consecutive_errors;
-                ir_debug.mod1.total_rx_count = mod->data_cache.total_rx_count;
-                ir_debug.mod1.last_rx_time = mod->last_rx_time;
-                if (mod->data_cache.valid) memcpy(ir_debug.rx_data, mod->data_cache.raw_data, 8);
-                ir_debug.rx_data_len = mod->last_response.length;
-                ir_debug.update_timestamp = mod->data_cache.update_timestamp;
+            ir_debug.mod_count = 0;
+            while (mod != NULL && ir_debug.mod_count < IR_HOST_MAX_MODULES) {
+                ir_debug.mods[ir_debug.mod_count].module_id = mod->module_id;
+                ir_debug.mods[ir_debug.mod_count].discovered = mod->discovered ? 1 : 0;
+                ir_debug.mods[ir_debug.mod_count].online = mod->online ? 1 : 0;
+                ir_debug.mods[ir_debug.mod_count].busy = mod->busy ? 1 : 0;
+                ir_debug.mods[ir_debug.mod_count].consecutive_errors = mod->consecutive_errors;
+                ir_debug.mods[ir_debug.mod_count].total_rx_count = mod->data_cache.total_rx_count;
+                ir_debug.mods[ir_debug.mod_count].last_rx_time = mod->last_rx_time;
+                ir_debug.mod_count++;
+                mod = mod->next;
             }
 
-            mod = mod != NULL ? mod->next : NULL;
-            if (mod != NULL) {
-                ir_debug.mod2.discovered = mod->discovered ? 1 : 0;
-                ir_debug.mod2.online = mod->online ? 1 : 0;
-                ir_debug.mod2.busy = mod->busy ? 1 : 0;
-                ir_debug.mod2.consecutive_errors = mod->consecutive_errors;
-                ir_debug.mod2.total_rx_count = mod->data_cache.total_rx_count;
-                ir_debug.mod2.last_rx_time = mod->last_rx_time;
+            // 保留第一个模块的 rx_data_len 和 update_timestamp 到顶层字段（兼容旧 dump 页面）
+            if (ir_host_context.module_list.head != NULL) {
+                ir_debug.rx_data_len = ir_host_context.module_list.head->last_response.length;
+                ir_debug.update_timestamp = ir_host_context.module_list.head->data_cache.update_timestamp;
             }
         }
 
@@ -1026,8 +1116,14 @@ static void IR_TaskEntry__(void *argument)
                 uint32_t now = xTaskGetTickCount();
                 if (now - ir_host_context.last_poll_time >= ir_host_context.poll_interval_ms) {
                     ir_host_context.last_poll_time = now;
-                    IR_Module_Node_t *module = IR_GetModuleByIndex__(ir_host_context.current_poll_index);
-                    if (module != NULL) IR_PollModule__(module);
+                    uint8_t poll_id = 0;
+                    xSemaphoreTake(ir_host_context.module_list.mutex, portMAX_DELAY);
+                    {
+                        IR_Module_Node_t *m = IR_FindModuleByIndexNoLock__(ir_host_context.current_poll_index);
+                        if (m != NULL) poll_id = m->module_id;
+                    }
+                    xSemaphoreGive(ir_host_context.module_list.mutex);
+                    if (poll_id != 0) IR_PollModuleById__(poll_id);
                     ir_host_context.current_poll_index++;
                     if (ir_host_context.current_poll_index >= ir_host_context.module_list.count) {
                         ir_host_context.current_poll_index = 0;
@@ -1063,17 +1159,8 @@ static void IR_TestTaskEntry__(void *argument)
 {
     (void)argument;
     uint32_t last_send_time = 0;
-    CAN_TxHeaderTypeDef tx_header;
-    uint32_t tx_mailbox;
 
-    //IR_Init(ir_host_context.hcan, (uint8_t[]){IR_HOST_DEFAULT_MODULE_ID}, 1);
     vTaskDelay(200);
-
-    tx_header.StdId = IR_HOST_CAN_ID_DATA(IR_HOST_DEFAULT_MODULE_ID);
-    tx_header.ExtId = 0;
-    tx_header.IDE = CAN_ID_STD;
-    tx_header.RTR = CAN_RTR_DATA;
-    tx_header.TransmitGlobalTime = DISABLE;
 
     for (;;) {
         ir_debug.test_cycle++;
@@ -1090,8 +1177,9 @@ static void IR_TestTaskEntry__(void *argument)
                 ir_debug.tx_data[5] = 0xFF;
                 ir_debug.tx_data[6] = 0x11;
                 ir_debug.tx_data[7] = 0x22;
-                tx_header.DLC = 8;
-                if (HAL_CAN_AddTxMessage(ir_host_context.hcan, &tx_header, ir_debug.tx_data, &tx_mailbox) == HAL_OK) {
+
+                // 广播发送：所有在线下位机同时转发红外
+                if (IR_SendBroadcast(ir_debug.tx_data, 8)) {
                     ir_debug.stats.tx_success_count++;
                     ir_debug.data_changed_flag = 1;
                     ir_debug.update_timestamp = xTaskGetTickCount();
@@ -1108,6 +1196,32 @@ static void IR_TestTaskEntry__(void *argument)
 
         vTaskDelay(pdMS_TO_TICKS(500));
     }
+}
+
+bool IR_SendBroadcast(uint8_t *data, uint8_t length)
+{
+    CAN_TxHeaderTypeDef tx_header;
+    uint32_t tx_mailbox;
+    uint8_t tx_data[8];
+
+    if (ir_host_context.hcan == NULL) return false;
+    if (length > 8 || length == 0) return false;
+
+    memset(tx_data, 0, 8);
+    memcpy(tx_data, data, length);
+
+    tx_header.StdId = IR_HOST_CAN_ID_DATA(0x00);  // 广播ID
+    tx_header.ExtId = 0;
+    tx_header.IDE = CAN_ID_STD;
+    tx_header.RTR = CAN_RTR_DATA;
+    tx_header.DLC = length;
+    tx_header.TransmitGlobalTime = DISABLE;
+
+    if (HAL_CAN_AddTxMessage(ir_host_context.hcan, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
+        return false;
+    }
+
+    return true;
 }
 
 void IR_StartTest(CAN_HandleTypeDef *hcan)

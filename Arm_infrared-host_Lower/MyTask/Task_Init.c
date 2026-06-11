@@ -14,7 +14,7 @@ extern TaskHandle_t Motor_Drive_Handle;
 extern TaskHandle_t MotorSendTask_Handle;
 extern TaskHandle_t MotorRecTask_Handle;
 TaskHandle_t Motor_Reset_Handle;
-TaskHandle_t IR_Host_Task_Handle;
+extern TaskHandle_t IR_Host_Task_Handle;
 
 void MotorInit(void);
 void Motor_reset(void *param);
@@ -53,7 +53,7 @@ void Task_Init(void)
 
 	
 	//红外模块初始化（CAN2）
-	IR_Init(&hcan2, (uint8_t[]){0x10,0x11}, 2);
+	IR_Init(&hcan2, (uint8_t[]){0x10,0x12,0x11}, 3);
 
 	RobStrideInit(&rs03, &hcan2, 0x02, RobStride_03);
 	RobStrideSetMode(&rs03, RobStride_MotionControl);
@@ -62,9 +62,9 @@ void Task_Init(void)
 	//vTaskDelay(100);
     vTaskDelay(2000);
     //MotorInit();
-    
-	//////xTaskCreate(Motor_Drive, "Motor_Drive", 628, NULL, 4, &Motor_Drive_Handle);//驱动
-	//////xTaskCreate(IR_Host_TaskEntry, "IR_Host_Task", 512, NULL, 3, &IR_Host_Task_Handle);//红外上位机
+    void IR_Host_Task(void *pvParameters);
+xTaskCreate(Motor_Drive, "Motor_Drive", 628, NULL, 4, &Motor_Drive_Handle);//驱动
+xTaskCreate(IR_Host_Task, "IR_Host_Task", 512, NULL, 3, &IR_Host_Task_Handle);//红外上位机
 	//	xTaskCreate(Motor_reset, "Motor_reset", 300, NULL, 4, &Motor_Reset_Handle);//复位
     //xTaskCreate(MotorSendTask, "MotorSendTask", 128, NULL, 4, &MotorSendTask_Handle);//将数据发送到PC
 		
