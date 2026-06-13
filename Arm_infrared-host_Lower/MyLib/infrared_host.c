@@ -712,7 +712,11 @@ static void IR_ProcessRxQueue__(void)
                     if (data_len > 0) memcpy(module->last_response.data, rx_frame.data, data_len);
                     module->last_rx_time = rx_frame.timestamp;
                     module->online = true;
-                    module->busy = false;
+                    /* 等待ACK期间不清busy，避免打破IR_SendRetry的契约：
+                       busy变false时status必须是SUCCESS或NACK */
+                    if (module->status != IR_HOST_STATUS_WAIT_ACK) {
+                        module->busy = false;
+                    }
                     module->discovered = true;
                     module->poll_fail_count = 0;
                     module->consecutive_errors = 0;
@@ -1020,7 +1024,9 @@ static void IR_TaskEntry__(void *argument)
                         if (data_len > 0) memcpy(module->last_response.data, rx_frame.data, data_len);
                         module->last_rx_time = rx_frame.timestamp;
                         module->online = true;
-                        module->busy = false;
+                        if (module->status != IR_HOST_STATUS_WAIT_ACK) {
+                            module->busy = false;
+                        }
                         module->discovered = true;
                         module->poll_fail_count = 0;
                         module->consecutive_errors = 0;
