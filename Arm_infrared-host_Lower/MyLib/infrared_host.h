@@ -163,6 +163,8 @@ typedef struct IR_Module_Node {
     uint8_t poll_fail_count;
     uint8_t consecutive_errors;
     struct IR_Module_Node *next;
+    volatile uint8_t ref_count;   ///< 引用计数: 0=可释放, 1=链表持有, >1=被调用方持有
+    bool deleted;                  ///< 标记删除: true=已从链表移除等待释放
 } IR_Module_Node_t;
 
 typedef struct {

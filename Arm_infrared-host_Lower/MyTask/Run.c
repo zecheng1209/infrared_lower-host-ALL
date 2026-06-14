@@ -84,11 +84,11 @@ void Motor_Drive(void *param)
 		// PID_Control(Joint[4].RM_motor.motor.Speed, Joint[4].RM_motor.pos_pid.pid_out, &Joint[4].RM_motor.vel_pid);
 		// can_buf[0] = Joint[4].RM_motor.vel_pid.pid_out * enable_Joint[4];
 		// MotorSend(&hcan2 ,0x200, can_buf);
-		
 
 		IR_Read(0x10, &ir_buf0[0], &ir_len0);
 		IR_Read(0x11, &ir_buf1[0], &ir_len1);
 		IR_Read(0x12, &ir_buf2[0], &ir_len2);
+		
 		
 		IR_Read(0x13, &ir_buf[0], &ir_len);
 
